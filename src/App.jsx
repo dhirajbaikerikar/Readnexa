@@ -1,12 +1,18 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as mammoth from "mammoth";
+import JSZip from "jszip";
+import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { supabase, BOOKS_BUCKET, ASSETS_BUCKET } from "./supabaseClient";
 import {
   BookOpen, BookMarked, Library, Upload, FileText, Download, Trash2, Plus,
   ArrowLeft, X, Check, AlertCircle, Loader2, Pencil, Save, RotateCcw,
-  ChevronLeft, ChevronRight, LayoutDashboard, BookCopy, Clock, CheckCircle2, Settings as SettingsIcon
+  ChevronLeft, ChevronRight, LayoutDashboard, BookCopy, Clock, CheckCircle2,
+  Settings as SettingsIcon, Sparkles, Sun, Moon
 } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Tooltip, Cell } from "recharts";
+
+GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
 /* ============================== PALETTE ============================== */
 // Primary/accent are themeable at runtime via CSS variables (set from Settings).
@@ -15,16 +21,16 @@ const DEFAULT_PRIMARY = "#5B2A2E";
 const DEFAULT_PRIMARY_DARK = "#3E1D20";
 const DEFAULT_ACCENT = "#AD8A56";
 
-const INK = "#241A15";
+const INK = "var(--ink)";
 const LEATHER = "var(--leather)";
 const LEATHER_DARK = "var(--leather-dark)";
 const GOLD = "var(--gold)";
-const PAPER = "#F6F1E6";
-const CARD = "#FFFDF8";
-const MUTED = "#8A7B68";
+const PAPER = "var(--bg)";
+const CARD = "var(--card)";
+const MUTED = "var(--muted)";
 const GREEN = "#3F7A57";
-const RED = "#A23B3B";
-const BORDER = "#E4DAC7";
+const RED = "#C24444";
+const BORDER = "var(--border)";
 
 function darkenHex(hex, factor = 0.7) {
   try {
@@ -77,6 +83,41 @@ function statusOf(book) {
   return { label: "Reading", color: GOLD };
 }
 
+/* ---- Smart page-count detection ----
+   PDF: reads the real page count via PDF.js.
+   DOCX: reads Word's own cached page-count metadata (docProps/app.xml),
+         falling back to a word-count-based estimate (~275 words/page)
+         if that metadata is missing. Legacy .doc files aren't supported
+         in-browser, so detection is skipped for those. */
+async function detectPdfPageCount(file) {
+  const buf = await file.arrayBuffer();
+  const doc = await getDocument({ data: buf }).promise;
+  return doc.numPages || null;
+}
+
+async function detectDocxPageCount(file) {
+  try {
+    const buf = await file.arrayBuffer();
+    const zip = await JSZip.loadAsync(buf);
+    const appXmlFile = zip.file("docProps/app.xml");
+    if (!appXmlFile) return null;
+    const xml = await appXmlFile.async("string");
+    const pagesMatch = /<Pages>(\d+)<\/Pages>/.exec(xml);
+    if (pagesMatch && parseInt(pagesMatch[1], 10) > 0) return parseInt(pagesMatch[1], 10);
+    const wordsMatch = /<Words>(\d+)<\/Words>/.exec(xml);
+    if (wordsMatch) return Math.max(1, Math.round(parseInt(wordsMatch[1], 10) / 275));
+  } catch (e) { /* fall through to null */ }
+  return null;
+}
+
+async function detectPageCount(file, ext) {
+  try {
+    if (ext === "pdf") return await detectPdfPageCount(file);
+    if (ext === "docx") return await detectDocxPageCount(file);
+  } catch (e) { return null; }
+  return null; // legacy .doc — not supported in-browser
+}
+
 /* ============================== ROOT APP ============================== */
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -114,6 +155,20 @@ export default function App() {
   const [editFolderError, setEditFolderError] = useState("");
 
   const [editingBook, setEditingBook] = useState(null); // {folderId, id, name, total_pages}
+
+  const [mode, setMode] = useState(() => {
+    try { return localStorage.getItem("readnexa-mode") || "light"; } catch (e) { return "light"; }
+  });
+  useEffect(() => {
+    document.documentElement.classList.toggle("dark", mode === "dark");
+    try { localStorage.setItem("readnexa-mode", mode); } catch (e) {}
+  }, [mode]);
+  const toggleMode = () => setMode((m) => (m === "light" ? "dark" : "light"));
+
+  // Page-count detection state for the upload flow
+  const [pageStage, setPageStage] = useState("entry"); // detecting | confirm | entry
+  const [detectedPages, setDetectedPages] = useState(null);
+  const [detectFailed, setDetectFailed] = useState(false);
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 2800); };
 
@@ -244,8 +299,28 @@ export default function App() {
     setPendingFile({ file, ext, size: file.size });
     setPendingName(cleanBaseName(file.name));
     setPendingPages("");
+    setDetectedPages(null);
+    setDetectFailed(false);
+    setPageStage("detecting");
+
+    const detected = await detectPageCount(file, ext);
+    if (detected && detected > 0) {
+      setDetectedPages(detected);
+      setPendingPages(String(detected));
+      setPageStage("confirm");
+    } else {
+      setDetectFailed(true);
+      setPageStage("entry");
+    }
   };
-  const cancelUpload = () => { setPendingFile(null); setPendingName(""); setPendingPages(""); setUploadError(""); };
+  const cancelUpload = () => {
+    setPendingFile(null); setPendingName(""); setPendingPages(""); setUploadError("");
+    setPageStage("entry"); setDetectedPages(null); setDetectFailed(false);
+  };
+  const confirmDetectedPages = (accepted) => {
+    if (!accepted) setPendingPages("");
+    setPageStage("entry");
+  };
 
   const confirmUploadSave = async () => {
     const pages = parseInt(pendingPages, 10);
@@ -324,7 +399,22 @@ export default function App() {
           --leather: ${DEFAULT_PRIMARY};
           --leather-dark: ${DEFAULT_PRIMARY_DARK};
           --gold: ${DEFAULT_ACCENT};
+          --bg: #F6F1E6;
+          --card: #FFFDF8;
+          --ink: #241A15;
+          --muted: #8A7B68;
+          --border: #E4DAC7;
+          --soft: #EFE7D5;
         }
+        html.dark {
+          --bg: #171310;
+          --card: #221C18;
+          --ink: #F1EAE0;
+          --muted: #A79A89;
+          --border: #3A322B;
+          --soft: #2A241E;
+        }
+        html.dark body { background: var(--bg); }
         @keyframes riseIn { from { opacity:0; transform: translateY(14px); } to { opacity:1; transform: translateY(0); } }
         @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
         @keyframes popIn { from { opacity:0; transform: scale(.94); } to { opacity:1; transform: scale(1); } }
@@ -345,7 +435,7 @@ export default function App() {
 
       <input ref={fileInputRef} type="file" accept=".pdf,.doc,.docx" className="hidden" onChange={onFileSelected} />
 
-      <TopBar view={view} theme={theme} onHome={() => { setView("dashboard"); setActiveFolderId(null); }} onOpenSettings={() => setShowSettings(true)} />
+      <TopBar view={view} theme={theme} mode={mode} onToggleMode={toggleMode} onHome={() => { setView("dashboard"); setActiveFolderId(null); }} onOpenSettings={() => setShowSettings(true)} />
 
       <main className="max-w-6xl mx-auto px-6 py-8">
         {loadError && (
@@ -447,15 +537,49 @@ export default function App() {
           <label className="text-sm block mb-1" style={{ color: MUTED }}>Book / document name</label>
           <input autoFocus value={pendingName} onChange={(e) => setPendingName(e.target.value)}
             className="w-full border rounded-md px-3 py-2 mb-4 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
-          <label className="text-sm block mb-1" style={{ color: MUTED }}>Total pages</label>
-          <input type="number" min="1" value={pendingPages} onChange={(e) => setPendingPages(e.target.value)}
-            placeholder="e.g. 120" onKeyDown={(e) => e.key === "Enter" && confirmUploadSave()}
-            className="w-full border rounded-md px-3 py-2 mb-2 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
-          <p className="text-xs mb-3" style={{ color: MUTED }}>Used to calculate the reading-progress bar shown on the shelf and dashboard.</p>
+
+          {pageStage === "detecting" && (
+            <div className="flex items-center gap-2 mb-4 p-3 rounded-md" style={{ background: "var(--soft)" }}>
+              <Loader2 className="animate-spin shrink-0" size={16} style={{ color: LEATHER }} />
+              <p className="text-sm" style={{ color: MUTED }}>Analyzing document to detect page count…</p>
+            </div>
+          )}
+
+          {pageStage === "confirm" && (
+            <div className="mb-4 p-3 rounded-md" style={{ background: "var(--soft)" }}>
+              <p className="text-sm flex items-center gap-1.5 mb-3" style={{ color: LEATHER_DARK }}>
+                <Sparkles size={15} style={{ color: GOLD }} /> We detected <span className="font-bold">{detectedPages}</span> pages in this document. Is that correct?
+              </p>
+              <div className="flex gap-2">
+                <button onClick={() => confirmDetectedPages(false)} className="px-3 py-1.5 rounded-md text-sm" style={{ border: `1px solid ${BORDER}`, color: LEATHER_DARK }}>No, let me correct it</button>
+                <button onClick={() => confirmDetectedPages(true)} className="btn-lift px-3 py-1.5 rounded-md text-sm font-medium text-white flex items-center gap-1.5" style={{ background: GREEN }}>
+                  <Check size={14} /> Yes, that's correct
+                </button>
+              </div>
+            </div>
+          )}
+
+          {pageStage === "entry" && (
+            <>
+              <label className="text-sm block mb-1" style={{ color: MUTED }}>Total pages</label>
+              <input type="number" min="1" value={pendingPages} onChange={(e) => setPendingPages(e.target.value)}
+                placeholder="e.g. 120" autoFocus={detectFailed || detectedPages === null}
+                onKeyDown={(e) => e.key === "Enter" && confirmUploadSave()}
+                className="w-full border rounded-md px-3 py-2 mb-2 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
+              {detectedPages !== null ? (
+                <p className="text-xs mb-3 flex items-center gap-1" style={{ color: MUTED }}><Pencil size={11} /> Enter the correct page count below.</p>
+              ) : detectFailed ? (
+                <p className="text-xs mb-3" style={{ color: MUTED }}>We couldn't automatically detect the page count for this file — please enter it manually.</p>
+              ) : (
+                <p className="text-xs mb-3" style={{ color: MUTED }}>Used to calculate the reading-progress bar shown on the shelf and dashboard.</p>
+              )}
+            </>
+          )}
+
           {uploadError && <p className="text-sm flex items-center gap-1.5 mb-2" style={{ color: RED }}><AlertCircle size={14} /> {uploadError}</p>}
           <div className="flex justify-end gap-3 mt-3">
             <button onClick={cancelUpload} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
-            <button onClick={confirmUploadSave} disabled={!pendingName.trim() || saving}
+            <button onClick={confirmUploadSave} disabled={!pendingName.trim() || saving || pageStage !== "entry" || !pendingPages}
               className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-40 flex items-center gap-2" style={{ background: LEATHER }}>
               {saving ? <Loader2 className="animate-spin" size={14} /> : <Check size={14} />} Save to shelf
             </button>
@@ -498,7 +622,7 @@ export default function App() {
 }
 
 /* ============================== TOP BAR ============================== */
-function TopBar({ view, theme, onHome, onOpenSettings }) {
+function TopBar({ view, theme, mode, onToggleMode, onHome, onOpenSettings }) {
   return (
     <header style={{ background: LEATHER_DARK, borderBottom: `3px solid ${GOLD}` }}>
       <div className="max-w-6xl mx-auto px-6 py-5 flex items-center justify-between">
@@ -519,6 +643,9 @@ function TopBar({ view, theme, onHome, onOpenSettings }) {
           <button onClick={onHome} className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md"
             style={{ color: "#F1E6D2", background: view === "dashboard" ? "rgba(255,255,255,0.08)" : "transparent", fontWeight: view === "dashboard" ? 600 : 400 }}>
             <LayoutDashboard size={15} /> <span className="hidden sm:inline">Dashboard</span>
+          </button>
+          <button onClick={onToggleMode} title={mode === "dark" ? "Switch to light mode" : "Switch to dark mode"} className="p-2 rounded-md hover:bg-white/10" style={{ color: "#F1E6D2" }}>
+            {mode === "dark" ? <Sun size={17} /> : <Moon size={17} />}
           </button>
           <button onClick={onOpenSettings} title="Site settings" className="p-2 rounded-md hover:bg-white/10" style={{ color: "#F1E6D2" }}>
             <SettingsIcon size={17} />
@@ -859,7 +986,7 @@ function BookRow({ book, color, delay, onRead, onEdit, onDelete }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
           <p className="font-serif font-bold" style={{ color: LEATHER_DARK }}>{book.name}</p>
-          <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: status.color + "22", color: status.color }}>{status.label}</span>
+          <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ background: `color-mix(in srgb, ${status.color} 22%, transparent)`, color: status.color }}>{status.label}</span>
         </div>
         <p className="text-xs font-mono mt-0.5" style={{ color: MUTED }}>{book.file_name} · {fmtBytes(book.size)} · added {stamp.date}</p>
         <div className="flex items-center gap-3 mt-2.5">
