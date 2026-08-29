@@ -1,2 +1,0 @@
-# Readnexa
-Reading + next generation
