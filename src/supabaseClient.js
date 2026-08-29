@@ -15,3 +15,4 @@ if (!supabaseUrl || !supabaseAnonKey) {
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 export const BOOKS_BUCKET = "books";
+export const ASSETS_BUCKET = "assets";

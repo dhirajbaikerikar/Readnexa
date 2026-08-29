@@ -1,24 +1,40 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import * as mammoth from "mammoth";
-import { supabase, BOOKS_BUCKET } from "./supabaseClient";
+import { supabase, BOOKS_BUCKET, ASSETS_BUCKET } from "./supabaseClient";
 import {
   BookOpen, BookMarked, Library, Upload, FileText, Download, Trash2, Plus,
   ArrowLeft, X, Check, AlertCircle, Loader2, Pencil, Save, RotateCcw,
-  ChevronLeft, ChevronRight, LayoutDashboard, BookCopy, Clock, CheckCircle2
+  ChevronLeft, ChevronRight, LayoutDashboard, BookCopy, Clock, CheckCircle2, Settings as SettingsIcon
 } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Tooltip, Cell } from "recharts";
 
 /* ============================== PALETTE ============================== */
+// Primary/accent are themeable at runtime via CSS variables (set from Settings).
+// The hex values here are just the DEFAULT values written into :root below.
+const DEFAULT_PRIMARY = "#5B2A2E";
+const DEFAULT_PRIMARY_DARK = "#3E1D20";
+const DEFAULT_ACCENT = "#AD8A56";
+
 const INK = "#241A15";
-const LEATHER = "#5B2A2E";
-const LEATHER_DARK = "#3E1D20";
-const GOLD = "#AD8A56";
+const LEATHER = "var(--leather)";
+const LEATHER_DARK = "var(--leather-dark)";
+const GOLD = "var(--gold)";
 const PAPER = "#F6F1E6";
 const CARD = "#FFFDF8";
 const MUTED = "#8A7B68";
 const GREEN = "#3F7A57";
 const RED = "#A23B3B";
 const BORDER = "#E4DAC7";
+
+function darkenHex(hex, factor = 0.7) {
+  try {
+    const h = hex.replace("#", "");
+    const r = Math.round(parseInt(h.substring(0, 2), 16) * factor);
+    const g = Math.round(parseInt(h.substring(2, 4), 16) * factor);
+    const b = Math.round(parseInt(h.substring(4, 6), 16) * factor);
+    return `#${[r, g, b].map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")).join("")}`;
+  } catch (e) { return DEFAULT_PRIMARY_DARK; }
+}
 
 const SPINES = ["#5B2A2E", "#2F4858", "#4C6444", "#7A5230", "#5C4A72"];
 function spineColor(seed) {
@@ -84,7 +100,28 @@ export default function App() {
   const [readingTarget, setReadingTarget] = useState(null);
   const [loadError, setLoadError] = useState("");
 
+  const [theme, setTheme] = useState({
+    site_name: "Readnexa",
+    tagline: "Read · Track · Remember",
+    logo_url: null,
+    primary_color: DEFAULT_PRIMARY,
+    accent_color: DEFAULT_ACCENT,
+  });
+  const [showSettings, setShowSettings] = useState(false);
+
+  const [showEditFolder, setShowEditFolder] = useState(null); // {id, name}
+  const [editFolderName, setEditFolderName] = useState("");
+  const [editFolderError, setEditFolderError] = useState("");
+
+  const [editingBook, setEditingBook] = useState(null); // {folderId, id, name, total_pages}
+
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 2800); };
+
+  const applyTheme = (t) => {
+    document.documentElement.style.setProperty("--leather", t.primary_color || DEFAULT_PRIMARY);
+    document.documentElement.style.setProperty("--leather-dark", darkenHex(t.primary_color || DEFAULT_PRIMARY, 0.68));
+    document.documentElement.style.setProperty("--gold", t.accent_color || DEFAULT_ACCENT);
+  };
 
   const loadAll = useCallback(async () => {
     setLoadError("");
@@ -101,20 +138,81 @@ export default function App() {
       grouped[b.folder_id].push(b);
     });
     setBooksByFolder(grouped);
+
+    const { data: settingsRow } = await supabase.from("site_settings").select("*").eq("id", 1).maybeSingle();
+    if (settingsRow) {
+      setTheme(settingsRow);
+      applyTheme(settingsRow);
+    } else {
+      applyTheme(theme);
+    }
+
     setReady(true);
   }, []);
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
+  const isDuplicateFolderName = (name, excludeId = null) =>
+    folders.some((f) => f.id !== excludeId && f.name.trim().toLowerCase() === name.trim().toLowerCase());
+
+  const saveSettings = async (patch) => {
+    const next = { ...theme, ...patch };
+    const { error } = await supabase.from("site_settings").upsert({ id: 1, ...next });
+    if (error) { showToast("Could not save settings: " + error.message); return; }
+    setTheme(next);
+    applyTheme(next);
+    showToast("Settings saved");
+  };
+
+  const renameFolder = async () => {
+    const name = editFolderName.trim();
+    if (!name) return;
+    if (isDuplicateFolderName(name, showEditFolder.id)) {
+      setEditFolderError("A shelf with this name already exists.");
+      return;
+    }
+    const { error } = await supabase.from("folders").update({ name }).eq("id", showEditFolder.id);
+    if (error) { setEditFolderError(error.message); return; }
+    setFolders((prev) => prev.map((f) => (f.id === showEditFolder.id ? { ...f, name } : f)));
+    setShowEditFolder(null); setEditFolderName(""); setEditFolderError("");
+    showToast("Shelf renamed");
+  };
+
+  const saveBookEdit = async () => {
+    if (!editingBook) return;
+    const name = editingBook.name.trim();
+    const pages = parseInt(editingBook.total_pages, 10);
+    if (!name) return;
+    if (!pages || pages < 1) { showToast("Total pages must be 1 or more."); return; }
+    const list = booksByFolder[editingBook.folderId] || [];
+    const current = list.find((b) => b.id === editingBook.id);
+    const clampedLastRead = Math.min(current ? current.last_read_page || 0 : 0, pages);
+    const patch = { name, total_pages: pages, last_read_page: clampedLastRead };
+    const { error } = await supabase.from("books").update(patch).eq("id", editingBook.id);
+    if (error) { showToast("Could not save: " + error.message); return; }
+    setBooksByFolder((prev) => ({
+      ...prev,
+      [editingBook.folderId]: (prev[editingBook.folderId] || []).map((b) => (b.id === editingBook.id ? { ...b, ...patch } : b)),
+    }));
+    setEditingBook(null);
+    showToast("Book updated");
+  };
+
+  const [newFolderError, setNewFolderError] = useState("");
+
   const createFolder = async () => {
     const name = newFolderName.trim();
     if (!name) return;
+    if (isDuplicateFolderName(name)) {
+      setNewFolderError("A shelf with this name already exists. Choose a different name.");
+      return;
+    }
     const id = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") + "-" + Date.now().toString(36);
     const { error } = await supabase.from("folders").insert({ id, name });
-    if (error) { showToast("Could not create shelf: " + error.message); return; }
+    if (error) { setNewFolderError("Could not create shelf: " + error.message); return; }
     setFolders((prev) => [...prev, { id, name, created_at: new Date().toISOString() }]);
     setBooksByFolder((prev) => ({ ...prev, [id]: [] }));
-    setShowNewFolder(false); setNewFolderName("");
+    setShowNewFolder(false); setNewFolderName(""); setNewFolderError("");
     showToast(`Shelf "${name}" created`);
   };
 
@@ -222,6 +320,11 @@ export default function App() {
   return (
     <div className="min-h-screen w-full" style={{ background: PAPER }}>
       <style>{`
+        :root {
+          --leather: ${DEFAULT_PRIMARY};
+          --leather-dark: ${DEFAULT_PRIMARY_DARK};
+          --gold: ${DEFAULT_ACCENT};
+        }
         @keyframes riseIn { from { opacity:0; transform: translateY(14px); } to { opacity:1; transform: translateY(0); } }
         @keyframes fadeIn { from { opacity:0; } to { opacity:1; } }
         @keyframes popIn { from { opacity:0; transform: scale(.94); } to { opacity:1; transform: scale(1); } }
@@ -242,7 +345,7 @@ export default function App() {
 
       <input ref={fileInputRef} type="file" accept=".pdf,.doc,.docx" className="hidden" onChange={onFileSelected} />
 
-      <TopBar view={view} onHome={() => { setView("dashboard"); setActiveFolderId(null); }} />
+      <TopBar view={view} theme={theme} onHome={() => { setView("dashboard"); setActiveFolderId(null); }} onOpenSettings={() => setShowSettings(true)} />
 
       <main className="max-w-6xl mx-auto px-6 py-8">
         {loadError && (
@@ -266,6 +369,7 @@ export default function App() {
             allBooksFlat={allBooksFlat}
             onOpenFolder={openFolder}
             onNewFolder={() => setShowNewFolder(true)}
+            onEditFolder={(f) => { setShowEditFolder(f); setEditFolderName(f.name); setEditFolderError(""); }}
             onDeleteFolder={(f) => setConfirmDelete({ type: "folder", id: f.id, name: f.name })}
             onContinueReading={(b) => setReadingTarget({ folderId: b.folder_id, book: b })}
           />
@@ -276,24 +380,64 @@ export default function App() {
             onBack={() => { setView("dashboard"); setActiveFolderId(null); }}
             onUploadClick={onPickFile}
             onRead={(book) => setReadingTarget({ folderId: activeFolderId, book })}
+            onEditBook={(b) => setEditingBook({ folderId: activeFolderId, id: b.id, name: b.name, total_pages: b.total_pages })}
             onDeleteBook={(b) => setConfirmDelete({ type: "book", id: b.id, name: b.name, folderId: activeFolderId })}
           />
         )}
       </main>
 
       {showNewFolder && (
-        <Modal onClose={() => { setShowNewFolder(false); setNewFolderName(""); }}>
+        <Modal onClose={() => { setShowNewFolder(false); setNewFolderName(""); setNewFolderError(""); }}>
           <h3 className="font-serif text-xl font-bold mb-4" style={{ color: LEATHER_DARK }}>New shelf</h3>
           <label className="text-sm block mb-1" style={{ color: MUTED }}>Shelf name</label>
-          <input autoFocus value={newFolderName} onChange={(e) => setNewFolderName(e.target.value)}
+          <input autoFocus value={newFolderName} onChange={(e) => { setNewFolderName(e.target.value); setNewFolderError(""); }}
             onKeyDown={(e) => e.key === "Enter" && createFolder()} placeholder="e.g. Business Analysis"
-            className="w-full border rounded-md px-3 py-2 mb-5 focus:outline-none focus:ring-2"
-            style={{ borderColor: BORDER }} />
-          <div className="flex justify-end gap-3">
-            <button onClick={() => { setShowNewFolder(false); setNewFolderName(""); }} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
+            className="w-full border rounded-md px-3 py-2 mb-2 focus:outline-none focus:ring-2"
+            style={{ borderColor: newFolderError ? RED : BORDER }} />
+          {newFolderError && <p className="text-sm flex items-center gap-1.5 mb-3" style={{ color: RED }}><AlertCircle size={14} /> {newFolderError}</p>}
+          <div className="flex justify-end gap-3 mt-3">
+            <button onClick={() => { setShowNewFolder(false); setNewFolderName(""); setNewFolderError(""); }} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
             <button onClick={createFolder} disabled={!newFolderName.trim()} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-40" style={{ background: LEATHER }}>Create shelf</button>
           </div>
         </Modal>
+      )}
+
+      {showEditFolder && (
+        <Modal onClose={() => { setShowEditFolder(null); setEditFolderError(""); }}>
+          <h3 className="font-serif text-xl font-bold mb-4" style={{ color: LEATHER_DARK }}>Rename shelf</h3>
+          <label className="text-sm block mb-1" style={{ color: MUTED }}>Shelf name</label>
+          <input autoFocus value={editFolderName} onChange={(e) => { setEditFolderName(e.target.value); setEditFolderError(""); }}
+            onKeyDown={(e) => e.key === "Enter" && renameFolder()}
+            className="w-full border rounded-md px-3 py-2 mb-2 focus:outline-none focus:ring-2"
+            style={{ borderColor: editFolderError ? RED : BORDER }} />
+          {editFolderError && <p className="text-sm flex items-center gap-1.5 mb-3" style={{ color: RED }}><AlertCircle size={14} /> {editFolderError}</p>}
+          <div className="flex justify-end gap-3 mt-3">
+            <button onClick={() => { setShowEditFolder(null); setEditFolderError(""); }} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
+            <button onClick={renameFolder} disabled={!editFolderName.trim()} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-40" style={{ background: LEATHER }}>Save name</button>
+          </div>
+        </Modal>
+      )}
+
+      {editingBook && (
+        <Modal onClose={() => setEditingBook(null)}>
+          <h3 className="font-serif text-xl font-bold mb-4" style={{ color: LEATHER_DARK }}>Edit book details</h3>
+          <label className="text-sm block mb-1" style={{ color: MUTED }}>Book / document name</label>
+          <input autoFocus value={editingBook.name} onChange={(e) => setEditingBook({ ...editingBook, name: e.target.value })}
+            className="w-full border rounded-md px-3 py-2 mb-4 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
+          <label className="text-sm block mb-1" style={{ color: MUTED }}>Total pages</label>
+          <input type="number" min="1" value={editingBook.total_pages} onChange={(e) => setEditingBook({ ...editingBook, total_pages: e.target.value })}
+            onKeyDown={(e) => e.key === "Enter" && saveBookEdit()}
+            className="w-full border rounded-md px-3 py-2 mb-2 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
+          <p className="text-xs mb-3" style={{ color: MUTED }}>If you lower the page count below your current reading progress, progress will be adjusted automatically.</p>
+          <div className="flex justify-end gap-3 mt-3">
+            <button onClick={() => setEditingBook(null)} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
+            <button onClick={saveBookEdit} disabled={!editingBook.name.trim()} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-40" style={{ background: LEATHER }}>Save changes</button>
+          </div>
+        </Modal>
+      )}
+
+      {showSettings && (
+        <SettingsModal theme={theme} onClose={() => setShowSettings(false)} onSave={saveSettings} />
       )}
 
       {pendingFile && (
@@ -354,25 +498,134 @@ export default function App() {
 }
 
 /* ============================== TOP BAR ============================== */
-function TopBar({ view, onHome }) {
+function TopBar({ view, theme, onHome, onOpenSettings }) {
   return (
     <header style={{ background: LEATHER_DARK, borderBottom: `3px solid ${GOLD}` }}>
       <div className="max-w-6xl mx-auto px-6 py-5 flex items-center justify-between">
-        <button onClick={onHome} className="flex items-center gap-3">
-          <div className="h-9 w-9 rounded-md flex items-center justify-center" style={{ background: GOLD }}>
-            <BookOpen size={19} style={{ color: LEATHER_DARK }} />
-          </div>
-          <div className="text-left">
-            <h1 className="font-serif text-2xl font-bold text-white leading-none">Readnexa</h1>
-            <p className="text-[11px] tracking-widest uppercase font-mono" style={{ color: "#D8C7A8" }}>Read · Track · Remember</p>
+        <button onClick={onHome} className="flex items-center gap-3 min-w-0">
+          {theme.logo_url ? (
+            <img src={theme.logo_url} alt="" className="h-9 w-9 rounded-md object-cover shrink-0" />
+          ) : (
+            <div className="h-9 w-9 rounded-md flex items-center justify-center shrink-0" style={{ background: GOLD }}>
+              <BookOpen size={19} style={{ color: LEATHER_DARK }} />
+            </div>
+          )}
+          <div className="text-left min-w-0">
+            <h1 className="font-serif text-2xl font-bold text-white leading-none truncate">{theme.site_name || "Readnexa"}</h1>
+            <p className="text-[11px] tracking-widest uppercase font-mono truncate" style={{ color: "#D8C7A8" }}>{theme.tagline || "Read · Track · Remember"}</p>
           </div>
         </button>
-        <button onClick={onHome} className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md"
-          style={{ color: "#F1E6D2", background: view === "dashboard" ? "rgba(255,255,255,0.08)" : "transparent", fontWeight: view === "dashboard" ? 600 : 400 }}>
-          <LayoutDashboard size={15} /> Dashboard
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          <button onClick={onHome} className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded-md"
+            style={{ color: "#F1E6D2", background: view === "dashboard" ? "rgba(255,255,255,0.08)" : "transparent", fontWeight: view === "dashboard" ? 600 : 400 }}>
+            <LayoutDashboard size={15} /> <span className="hidden sm:inline">Dashboard</span>
+          </button>
+          <button onClick={onOpenSettings} title="Site settings" className="p-2 rounded-md hover:bg-white/10" style={{ color: "#F1E6D2" }}>
+            <SettingsIcon size={17} />
+          </button>
+        </div>
       </div>
     </header>
+  );
+}
+
+/* ============================== SETTINGS MODAL ============================== */
+function SettingsModal({ theme, onClose, onSave }) {
+  const [siteName, setSiteName] = useState(theme.site_name || "Readnexa");
+  const [tagline, setTagline] = useState(theme.tagline || "");
+  const [primary, setPrimary] = useState(theme.primary_color || DEFAULT_PRIMARY);
+  const [accent, setAccent] = useState(theme.accent_color || DEFAULT_ACCENT);
+  const [logoFile, setLogoFile] = useState(null);
+  const [logoPreview, setLogoPreview] = useState(theme.logo_url || null);
+  const [removeLogo, setRemoveLogo] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+  const logoInputRef = useRef(null);
+
+  const onPickLogo = (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { setErr("Please choose an image file for the logo."); return; }
+    if (file.size > 1.5 * 1024 * 1024) { setErr("Logo image should be under 1.5MB."); return; }
+    setErr("");
+    setLogoFile(file);
+    setRemoveLogo(false);
+    setLogoPreview(URL.createObjectURL(file));
+  };
+
+  const handleSave = async () => {
+    if (!siteName.trim()) { setErr("Site name can't be empty."); return; }
+    setSaving(true);
+    let logo_url = theme.logo_url || null;
+    try {
+      if (removeLogo) {
+        logo_url = null;
+      } else if (logoFile) {
+        const path = `logo-${Date.now()}-${logoFile.name}`;
+        const { error: upErr } = await supabase.storage.from(ASSETS_BUCKET).upload(path, logoFile, { upsert: false });
+        if (upErr) throw upErr;
+        const { data: pub } = supabase.storage.from(ASSETS_BUCKET).getPublicUrl(path);
+        logo_url = pub.publicUrl;
+      }
+      await onSave({ site_name: siteName.trim(), tagline: tagline.trim(), primary_color: primary, accent_color: accent, logo_url });
+      onClose();
+    } catch (e) {
+      setErr("Could not save logo: " + (e.message || "unknown error") + ". Make sure the 'assets' storage bucket exists and is public.");
+    }
+    setSaving(false);
+  };
+
+  return (
+    <Modal onClose={onClose}>
+      <h3 className="font-serif text-xl font-bold mb-4" style={{ color: LEATHER_DARK }}>Site settings</h3>
+
+      <label className="text-sm block mb-1" style={{ color: MUTED }}>Site name</label>
+      <input value={siteName} onChange={(e) => setSiteName(e.target.value)}
+        className="w-full border rounded-md px-3 py-2 mb-4 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
+
+      <label className="text-sm block mb-1" style={{ color: MUTED }}>Tagline</label>
+      <input value={tagline} onChange={(e) => setTagline(e.target.value)} placeholder="Read · Track · Remember"
+        className="w-full border rounded-md px-3 py-2 mb-4 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
+
+      <label className="text-sm block mb-2" style={{ color: MUTED }}>Logo</label>
+      <div className="flex items-center gap-3 mb-4">
+        <div className="h-12 w-12 rounded-md flex items-center justify-center shrink-0 overflow-hidden" style={{ background: primary }}>
+          {logoPreview && !removeLogo ? <img src={logoPreview} className="h-full w-full object-cover" alt="" /> : <BookOpen size={20} color="white" />}
+        </div>
+        <button onClick={() => logoInputRef.current.click()} className="px-3 py-1.5 rounded-md text-sm" style={{ border: `1px solid ${BORDER}`, color: LEATHER_DARK }}>Upload image</button>
+        {logoPreview && !removeLogo && (
+          <button onClick={() => { setRemoveLogo(true); setLogoPreview(null); setLogoFile(null); }} className="text-sm" style={{ color: RED }}>Remove</button>
+        )}
+        <input ref={logoInputRef} type="file" accept="image/*" className="hidden" onChange={onPickLogo} />
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 mb-4">
+        <div>
+          <label className="text-sm block mb-1" style={{ color: MUTED }}>Primary color</label>
+          <div className="flex items-center gap-2">
+            <input type="color" value={primary} onChange={(e) => setPrimary(e.target.value)} className="h-9 w-10 rounded border p-0.5" style={{ borderColor: BORDER }} />
+            <input value={primary} onChange={(e) => setPrimary(e.target.value)} className="w-full border rounded-md px-2 py-1.5 text-sm font-mono" style={{ borderColor: BORDER }} />
+          </div>
+        </div>
+        <div>
+          <label className="text-sm block mb-1" style={{ color: MUTED }}>Accent color</label>
+          <div className="flex items-center gap-2">
+            <input type="color" value={accent} onChange={(e) => setAccent(e.target.value)} className="h-9 w-10 rounded border p-0.5" style={{ borderColor: BORDER }} />
+            <input value={accent} onChange={(e) => setAccent(e.target.value)} className="w-full border rounded-md px-2 py-1.5 text-sm font-mono" style={{ borderColor: BORDER }} />
+          </div>
+        </div>
+      </div>
+
+      {err && <p className="text-sm flex items-center gap-1.5 mb-3" style={{ color: RED }}><AlertCircle size={14} /> {err}</p>}
+
+      <div className="flex justify-end gap-3 mt-2">
+        <button onClick={onClose} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
+        <button onClick={handleSave} disabled={saving} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white flex items-center gap-2 disabled:opacity-50" style={{ background: primary }}>
+          {saving ? <Loader2 className="animate-spin" size={14} /> : <Check size={14} />} Save settings
+        </button>
+      </div>
+    </Modal>
   );
 }
 
@@ -404,7 +657,7 @@ function CircleProgress({ percent, size = 54, stroke = 6, color = GREEN }) {
 }
 
 /* ============================== DASHBOARD ============================== */
-function Dashboard({ folders, booksByFolder, allBooksFlat, onOpenFolder, onNewFolder, onDeleteFolder, onContinueReading }) {
+function Dashboard({ folders, booksByFolder, allBooksFlat, onOpenFolder, onNewFolder, onEditFolder, onDeleteFolder, onContinueReading }) {
   const totalBooks = allBooksFlat.length;
   const totalPagesAll = allBooksFlat.reduce((s, b) => s + (b.total_pages || 0), 0);
   const readPagesAll = allBooksFlat.reduce((s, b) => s + Math.min(b.last_read_page || 0, b.total_pages || 0), 0);
@@ -508,7 +761,7 @@ function Dashboard({ folders, booksByFolder, allBooksFlat, onOpenFolder, onNewFo
           const pct = tp > 0 ? Math.round((rp / tp) * 100) : 0;
           return (
             <ShelfCard key={f.id} folder={f} count={list.length} percent={pct} delay={i * 70}
-              onOpen={() => onOpenFolder(f.id)} onDelete={() => onDeleteFolder(f)} />
+              onOpen={() => onOpenFolder(f.id)} onEdit={() => onEditFolder(f)} onDelete={() => onDeleteFolder(f)} />
           );
         })}
       </div>
@@ -525,7 +778,7 @@ function StatCard({ icon, label, value, delay }) {
   );
 }
 
-function ShelfCard({ folder, count, percent, delay, onOpen, onDelete }) {
+function ShelfCard({ folder, count, percent, delay, onOpen, onEdit, onDelete }) {
   const color = spineColor(folder.id);
   const [hover, setHover] = useState(false);
   return (
@@ -537,11 +790,16 @@ function ShelfCard({ folder, count, percent, delay, onOpen, onDelete }) {
           <CircleProgress percent={percent} size={54} stroke={6} color={color} />
           <div className="flex-1 min-w-0">
             <div className="flex items-start justify-between gap-2">
-              <h4 className="font-serif font-bold text-base" style={{ color: LEATHER_DARK }}>{folder.name}</h4>
+              <h4 className="font-serif font-bold text-base truncate" style={{ color: LEATHER_DARK }}>{folder.name}</h4>
               {hover && (
-                <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="p-1 -m-1 shrink-0" style={{ color: MUTED }} title="Delete shelf">
-                  <Trash2 size={14} />
-                </button>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button onClick={(e) => { e.stopPropagation(); onEdit(); }} className="p-1 -m-1" style={{ color: MUTED }} title="Rename shelf">
+                    <Pencil size={13} />
+                  </button>
+                  <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="p-1 -m-1" style={{ color: MUTED }} title="Delete shelf">
+                    <Trash2 size={14} />
+                  </button>
+                </div>
               )}
             </div>
             <p className="text-xs font-mono mt-1" style={{ color: MUTED }}>{count} book{count !== 1 ? "s" : ""}</p>
@@ -553,7 +811,7 @@ function ShelfCard({ folder, count, percent, delay, onOpen, onDelete }) {
 }
 
 /* ============================== SHELF VIEW ============================== */
-function ShelfView({ folder, books, onBack, onUploadClick, onRead, onDeleteBook }) {
+function ShelfView({ folder, books, onBack, onUploadClick, onRead, onEditBook, onDeleteBook }) {
   if (!folder) return null;
   const color = spineColor(folder.id);
   return (
@@ -582,14 +840,14 @@ function ShelfView({ folder, books, onBack, onUploadClick, onRead, onDeleteBook 
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4">
-          {books.map((b, i) => <BookRow key={b.id} book={b} color={color} delay={i * 50} onRead={() => onRead(b)} onDelete={() => onDeleteBook(b)} />)}
+          {books.map((b, i) => <BookRow key={b.id} book={b} color={color} delay={i * 50} onRead={() => onRead(b)} onEdit={() => onEditBook(b)} onDelete={() => onDeleteBook(b)} />)}
         </div>
       )}
     </div>
   );
 }
 
-function BookRow({ book, color, delay, onRead, onDelete }) {
+function BookRow({ book, color, delay, onRead, onEdit, onDelete }) {
   const pct = progressOf(book);
   const status = statusOf(book);
   const stamp = fmtStamp(book.uploaded_at);
@@ -615,6 +873,7 @@ function BookRow({ book, color, delay, onRead, onDelete }) {
         <button onClick={onRead} className="btn-lift flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-white" style={{ background: color }}>
           <BookOpen size={15} /> Read
         </button>
+        <button onClick={onEdit} title="Edit details" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Pencil size={16} /></button>
         <a href={book.file_url} download={book.file_name} title="Download" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Download size={17} /></a>
         <button onClick={onDelete} title="Delete" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Trash2 size={17} /></button>
       </div>
