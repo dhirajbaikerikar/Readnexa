@@ -1,12 +1,5 @@
 # Readnexa — Setup & Deploy Guide
 
-## Why you got the 404
-
-You uploaded the raw `folio.jsx` file straight to GitHub. A browser cannot run a `.jsx`
-file directly — it needs to be **built** first (turned into a real `index.html` +
-bundled JavaScript) by a tool called Vite. GitHub Pages looked for an `index.html`
-at the root of your site and found nothing → 404.
-
 This folder is a complete, buildable project. Once it's set up, GitHub Actions
 builds it automatically every time you push, and Pages serves the result.
 
