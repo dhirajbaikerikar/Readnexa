@@ -205,6 +205,15 @@ export default function App() {
   const [detectedPages, setDetectedPages] = useState(null);
   const [detectFailed, setDetectFailed] = useState(false);
 
+  const [notes, setNotes] = useState([]);
+  const [collections, setCollections] = useState([]);
+  const [showNoteEditor, setShowNoteEditor] = useState(null); // {id?, title, content} | null
+  const [activeCollectionId, setActiveCollectionId] = useState(null);
+  const [showManageCollectionBooks, setShowManageCollectionBooks] = useState(false);
+  const [newCollectionName, setNewCollectionName] = useState("");
+  const [showNewCollection, setShowNewCollection] = useState(false);
+  const [confirmPermanentDelete, setConfirmPermanentDelete] = useState(null); // {folderId, id, name}
+
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(""), 2800); };
 
   const applyTheme = (t) => {
@@ -236,6 +245,11 @@ export default function App() {
     } else {
       applyTheme(theme);
     }
+
+    const { data: noteRows } = await supabase.from("notes").select("*").order("updated_at", { ascending: false });
+    setNotes(noteRows || []);
+    const { data: collectionRows } = await supabase.from("collections").select("*").order("created_at");
+    setCollections(collectionRows || []);
 
     setReady(true);
   }, []);
@@ -401,12 +415,86 @@ export default function App() {
   };
 
   const deleteBook = async (folderId, bookId) => {
+    // Soft delete — moves the book to Trash rather than removing it immediately.
+    await updateBook(folderId, bookId, { deleted_at: new Date().toISOString() });
+    setConfirmDelete(null);
+    showToast("Moved to Trash");
+  };
+
+  const restoreBook = async (folderId, bookId) => {
+    await updateBook(folderId, bookId, { deleted_at: null });
+    showToast("Book restored");
+  };
+
+  const permanentlyDeleteBook = async (folderId, bookId) => {
     const book = (booksByFolder[folderId] || []).find((b) => b.id === bookId);
     if (book && book.storage_path) await supabase.storage.from(BOOKS_BUCKET).remove([book.storage_path]);
     await supabase.from("books").delete().eq("id", bookId);
     setBooksByFolder((prev) => ({ ...prev, [folderId]: (prev[folderId] || []).filter((b) => b.id !== bookId) }));
-    setConfirmDelete(null);
-    showToast("Book removed");
+    // Also remove it from any collections it was part of.
+    setCollections((prev) => prev.map((c) => ({ ...c, book_ids: (c.book_ids || []).filter((id) => id !== bookId) })));
+    collections.forEach((c) => {
+      if ((c.book_ids || []).includes(bookId)) {
+        supabase.from("collections").update({ book_ids: (c.book_ids || []).filter((id) => id !== bookId) }).eq("id", c.id);
+      }
+    });
+    setConfirmPermanentDelete(null);
+    showToast("Deleted permanently");
+  };
+
+  const toggleFavorite = async (folderId, bookId, current) => {
+    await updateBook(folderId, bookId, { is_favorite: !current });
+  };
+
+  // ---- Notes ----
+  const saveNote = async (note) => {
+    const now = new Date().toISOString();
+    if (note.id) {
+      const patch = { title: note.title.trim() || "Untitled note", content: note.content, updated_at: now };
+      const { error } = await supabase.from("notes").update(patch).eq("id", note.id);
+      if (error) { showToast("Could not save note: " + error.message); return; }
+      setNotes((prev) => prev.map((n) => (n.id === note.id ? { ...n, ...patch } : n)));
+    } else {
+      const row = { id: "n_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: note.title.trim() || "Untitled note", content: note.content, created_at: now, updated_at: now };
+      const { error } = await supabase.from("notes").insert(row);
+      if (error) { showToast("Could not create note: " + error.message); return; }
+      setNotes((prev) => [row, ...prev]);
+    }
+    setShowNoteEditor(null);
+    showToast("Note saved");
+  };
+  const deleteNote = async (id) => {
+    await supabase.from("notes").delete().eq("id", id);
+    setNotes((prev) => prev.filter((n) => n.id !== id));
+    showToast("Note deleted");
+  };
+
+  // ---- Collections ----
+  const createCollection = async () => {
+    const name = newCollectionName.trim();
+    if (!name) return;
+    const row = { id: "col_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name, book_ids: [], created_at: new Date().toISOString() };
+    const { error } = await supabase.from("collections").insert(row);
+    if (error) { showToast("Could not create collection: " + error.message); return; }
+    setCollections((prev) => [...prev, row]);
+    setShowNewCollection(false);
+    setNewCollectionName("");
+    showToast(`Collection "${name}" created`);
+  };
+  const deleteCollection = async (id) => {
+    await supabase.from("collections").delete().eq("id", id);
+    setCollections((prev) => prev.filter((c) => c.id !== id));
+    if (activeCollectionId === id) setActiveCollectionId(null);
+    showToast("Collection deleted");
+  };
+  const toggleBookInCollection = async (collectionId, bookId) => {
+    const col = collections.find((c) => c.id === collectionId);
+    if (!col) return;
+    const has = (col.book_ids || []).includes(bookId);
+    const nextIds = has ? col.book_ids.filter((id) => id !== bookId) : [...(col.book_ids || []), bookId];
+    const { error } = await supabase.from("collections").update({ book_ids: nextIds }).eq("id", collectionId);
+    if (error) { showToast("Could not update collection: " + error.message); return; }
+    setCollections((prev) => prev.map((c) => (c.id === collectionId ? { ...c, book_ids: nextIds } : c)));
   };
 
   const updateBook = async (folderId, bookId, patch) => {
@@ -419,12 +507,18 @@ export default function App() {
   };
 
   const activeFolder = folders.find((f) => f.id === activeFolderId);
-  const activeBooks = booksByFolder[activeFolderId] || [];
+  const activeBooks = (booksByFolder[activeFolderId] || []).filter((b) => !b.deleted_at);
 
   const allBooksFlat = useMemo(() => {
     const out = [];
-    folders.forEach((f) => (booksByFolder[f.id] || []).forEach((b) => out.push({ ...b, folderName: f.name })));
+    folders.forEach((f) => (booksByFolder[f.id] || []).forEach((b) => { if (!b.deleted_at) out.push({ ...b, folderName: f.name }); }));
     return out;
+  }, [folders, booksByFolder]);
+
+  const trashedBooksFlat = useMemo(() => {
+    const out = [];
+    folders.forEach((f) => (booksByFolder[f.id] || []).forEach((b) => { if (b.deleted_at) out.push({ ...b, folderName: f.name }); }));
+    return out.sort((a, b) => new Date(b.deleted_at) - new Date(a.deleted_at));
   }, [folders, booksByFolder]);
 
   return (
@@ -477,7 +571,7 @@ export default function App() {
         onSearchSelect={(b) => setReadingTarget({ folderId: b.folder_id, book: b })} />
 
       <div className="flex items-start">
-        <Sidebar view={view} onNavigate={(v) => { setView(v); setActiveFolderId(null); }} />
+        <Sidebar view={view} onNavigate={(v) => { setView(v); setActiveFolderId(null); setActiveCollectionId(null); }} />
 
         <main className="flex-1 min-w-0 px-6 py-8 max-w-6xl mx-auto">
         {loadError && (
@@ -519,6 +613,7 @@ export default function App() {
             onEditBook={(b) => setEditingBook({ folderId: b.folder_id, id: b.id, name: b.name, total_pages: b.total_pages })}
             onResetProgress={(b) => setConfirmReset({ folderId: b.folder_id, id: b.id, name: b.name })}
             onDeleteBook={(b) => setConfirmDelete({ type: "book", id: b.id, name: b.name, folderId: b.folder_id })}
+            onToggleFavorite={(b) => toggleFavorite(b.folder_id, b.id, b.is_favorite)}
           />
         ) : view === "shelf" ? (
           <ShelfView
@@ -530,7 +625,44 @@ export default function App() {
             onEditBook={(b) => setEditingBook({ folderId: activeFolderId, id: b.id, name: b.name, total_pages: b.total_pages })}
             onResetProgress={(b) => setConfirmReset({ folderId: activeFolderId, id: b.id, name: b.name })}
             onDeleteBook={(b) => setConfirmDelete({ type: "book", id: b.id, name: b.name, folderId: activeFolderId })}
+            onToggleFavorite={(b) => toggleFavorite(activeFolderId, b.id, b.is_favorite)}
           />
+        ) : view === "favorites" ? (
+          <FlatBookListView
+            title="Favorites"
+            subtitle="Books and documents you've marked as favorites."
+            books={allBooksFlat.filter((b) => b.is_favorite)}
+            onRead={(b) => setReadingTarget({ folderId: b.folder_id, book: b })}
+            onEditBook={(b) => setEditingBook({ folderId: b.folder_id, id: b.id, name: b.name, total_pages: b.total_pages })}
+            onResetProgress={(b) => setConfirmReset({ folderId: b.folder_id, id: b.id, name: b.name })}
+            onDeleteBook={(b) => setConfirmDelete({ type: "book", id: b.id, name: b.name, folderId: b.folder_id })}
+            onToggleFavorite={(b) => toggleFavorite(b.folder_id, b.id, b.is_favorite)}
+            emptyText="No favorites yet — tap the star on any book to add it here."
+          />
+        ) : view === "notes" ? (
+          <NotesView notes={notes} onNew={() => setShowNoteEditor({ title: "", content: "" })}
+            onEdit={(n) => setShowNoteEditor(n)} onDelete={deleteNote} />
+        ) : view === "collections" ? (
+          activeCollectionId ? (
+            <CollectionDetailView
+              collection={collections.find((c) => c.id === activeCollectionId)}
+              books={allBooksFlat.filter((b) => (collections.find((c) => c.id === activeCollectionId)?.book_ids || []).includes(b.id))}
+              onBack={() => setActiveCollectionId(null)}
+              onManageBooks={() => setShowManageCollectionBooks(true)}
+              onDelete={() => deleteCollection(activeCollectionId)}
+              onRead={(b) => setReadingTarget({ folderId: b.folder_id, book: b })}
+              onEditBook={(b) => setEditingBook({ folderId: b.folder_id, id: b.id, name: b.name, total_pages: b.total_pages })}
+              onResetProgress={(b) => setConfirmReset({ folderId: b.folder_id, id: b.id, name: b.name })}
+              onDeleteBook={(b) => setConfirmDelete({ type: "book", id: b.id, name: b.name, folderId: b.folder_id })}
+              onToggleFavorite={(b) => toggleFavorite(b.folder_id, b.id, b.is_favorite)}
+            />
+          ) : (
+            <CollectionsView collections={collections} onOpen={(id) => setActiveCollectionId(id)} onNew={() => setShowNewCollection(true)} />
+          )
+        ) : view === "trash" ? (
+          <TrashView books={trashedBooksFlat}
+            onRestore={(b) => restoreBook(b.folder_id, b.id)}
+            onPermanentDelete={(b) => setConfirmPermanentDelete({ folderId: b.folder_id, id: b.id, name: b.name })} />
         ) : (
           <ComingSoonView view={view} />
         )}
@@ -607,6 +739,77 @@ export default function App() {
         <SettingsModal theme={theme} onClose={() => setShowSettings(false)} onSave={saveSettings} />
       )}
 
+      {showNoteEditor && (
+        <Modal onClose={() => setShowNoteEditor(null)}>
+          <h3 className="font-serif text-xl font-bold mb-4" style={{ color: LEATHER_DARK }}>{showNoteEditor.id ? "Edit note" : "New note"}</h3>
+          <input autoFocus value={showNoteEditor.title} onChange={(e) => setShowNoteEditor({ ...showNoteEditor, title: e.target.value })}
+            placeholder="Title" className="w-full border rounded-md px-3 py-2 mb-3 font-medium focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
+          <textarea value={showNoteEditor.content} onChange={(e) => setShowNoteEditor({ ...showNoteEditor, content: e.target.value })}
+            placeholder="Write your note…" rows={7}
+            className="w-full border rounded-md px-3 py-2 mb-4 focus:outline-none focus:ring-2 resize-none" style={{ borderColor: BORDER }} />
+          <div className="flex justify-end gap-3">
+            <button onClick={() => setShowNoteEditor(null)} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
+            <button onClick={() => saveNote(showNoteEditor)} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white flex items-center gap-2" style={{ background: LEATHER }}>
+              <Save size={14} /> Save note
+            </button>
+          </div>
+        </Modal>
+      )}
+
+      {showNewCollection && (
+        <Modal onClose={() => { setShowNewCollection(false); setNewCollectionName(""); }}>
+          <h3 className="font-serif text-xl font-bold mb-4" style={{ color: LEATHER_DARK }}>New collection</h3>
+          <label className="text-sm block mb-1" style={{ color: MUTED }}>Collection name</label>
+          <input autoFocus value={newCollectionName} onChange={(e) => setNewCollectionName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && createCollection()} placeholder="e.g. Interview Prep"
+            className="w-full border rounded-md px-3 py-2 mb-5 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
+          <div className="flex justify-end gap-3">
+            <button onClick={() => { setShowNewCollection(false); setNewCollectionName(""); }} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
+            <button onClick={createCollection} disabled={!newCollectionName.trim()} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white disabled:opacity-40" style={{ background: LEATHER }}>Create</button>
+          </div>
+        </Modal>
+      )}
+
+      {showManageCollectionBooks && activeCollectionId && (
+        <Modal onClose={() => setShowManageCollectionBooks(false)}>
+          <h3 className="font-serif text-xl font-bold mb-4" style={{ color: LEATHER_DARK }}>Manage books in this collection</h3>
+          <div className="max-h-80 overflow-y-auto -mx-1 px-1">
+            {allBooksFlat.length === 0 ? (
+              <p className="text-sm" style={{ color: MUTED }}>No books uploaded yet.</p>
+            ) : allBooksFlat.map((b) => {
+              const col = collections.find((c) => c.id === activeCollectionId);
+              const checked = (col?.book_ids || []).includes(b.id);
+              return (
+                <label key={b.id} className="flex items-center gap-3 px-2 py-2 rounded-md hover:bg-black/5 cursor-pointer">
+                  <input type="checkbox" checked={checked} onChange={() => toggleBookInCollection(activeCollectionId, b.id)} />
+                  <span className="text-sm truncate flex-1" style={{ color: INK }}>{b.name}</span>
+                  <span className="text-xs shrink-0" style={{ color: MUTED }}>{b.folderName}</span>
+                </label>
+              );
+            })}
+          </div>
+          <div className="flex justify-end mt-5">
+            <button onClick={() => setShowManageCollectionBooks(false)} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white" style={{ background: LEATHER }}>Done</button>
+          </div>
+        </Modal>
+      )}
+
+      {confirmPermanentDelete && (
+        <Modal onClose={() => setConfirmPermanentDelete(null)}>
+          <h3 className="font-serif text-xl font-bold mb-2" style={{ color: LEATHER_DARK }}>Delete permanently?</h3>
+          <p className="text-sm mb-6" style={{ color: MUTED }}>
+            "{confirmPermanentDelete.name}" and its file will be permanently deleted. This cannot be undone.
+          </p>
+          <div className="flex justify-end gap-3">
+            <button onClick={() => setConfirmPermanentDelete(null)} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
+            <button onClick={() => permanentlyDeleteBook(confirmPermanentDelete.folderId, confirmPermanentDelete.id)}
+              className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white flex items-center gap-2" style={{ background: RED }}>
+              <Trash2 size={14} /> Delete permanently
+            </button>
+          </div>
+        </Modal>
+      )}
+
       {pendingFile && (
         <Modal onClose={cancelUpload}>
           <h3 className="font-serif text-xl font-bold mb-1" style={{ color: LEATHER_DARK }}>Add this book</h3>
@@ -627,6 +830,9 @@ export default function App() {
               <p className="text-sm flex items-center gap-1.5 mb-3" style={{ color: LEATHER_DARK }}>
                 <Sparkles size={15} style={{ color: GOLD }} /> We detected <span className="font-bold">{detectedPages}</span> pages in this document. Is that correct?
               </p>
+              {pendingFile && pendingFile.ext === "docx" && (
+                <p className="text-xs mb-3" style={{ color: MUTED }}>Based on how it renders in the browser — for an exact match to Word's own count, upload as PDF instead.</p>
+              )}
               <div className="flex gap-2">
                 <button onClick={() => confirmDetectedPages(false)} className="px-3 py-1.5 rounded-md text-sm" style={{ border: `1px solid ${BORDER}`, color: LEATHER_DARK }}>No, let me correct it</button>
                 <button onClick={() => confirmDetectedPages(true)} className="btn-lift px-3 py-1.5 rounded-md text-sm font-medium text-white flex items-center gap-1.5" style={{ background: GREEN }}>
@@ -666,15 +872,19 @@ export default function App() {
 
       {confirmDelete && (
         <Modal onClose={() => setConfirmDelete(null)}>
-          <h3 className="font-serif text-xl font-bold mb-2" style={{ color: LEATHER_DARK }}>Delete {confirmDelete.type === "folder" ? "shelf" : "book"}?</h3>
+          <h3 className="font-serif text-xl font-bold mb-2" style={{ color: LEATHER_DARK }}>
+            {confirmDelete.type === "folder" ? "Delete shelf?" : "Move to Trash?"}
+          </h3>
           <p className="text-sm mb-6" style={{ color: MUTED }}>
-            "{confirmDelete.name}" will be permanently removed{confirmDelete.type === "folder" ? ", along with every book on it" : ""}. This cannot be undone.
+            {confirmDelete.type === "folder"
+              ? `"${confirmDelete.name}" will be permanently removed, along with every book on it. This cannot be undone.`
+              : `"${confirmDelete.name}" will be moved to Trash, where you can restore it or delete it permanently later.`}
           </p>
           <div className="flex justify-end gap-3">
             <button onClick={() => setConfirmDelete(null)} className="px-4 py-2 rounded-md text-sm" style={{ color: MUTED }}>Cancel</button>
             <button onClick={() => confirmDelete.type === "folder" ? deleteFolder(confirmDelete.id) : deleteBook(confirmDelete.folderId, confirmDelete.id)}
               className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white flex items-center gap-2" style={{ background: RED }}>
-              <Trash2 size={14} /> Delete
+              <Trash2 size={14} /> {confirmDelete.type === "folder" ? "Delete" : "Move to Trash"}
             </button>
           </div>
         </Modal>
@@ -860,11 +1070,11 @@ const NAV_ITEMS = [
   { id: "dashboard", label: "Home", icon: LayoutDashboard, enabled: true },
   { id: "library", label: "My Library", icon: Library, enabled: true },
   { id: "recent", label: "Recent", icon: Clock, enabled: true },
-  { id: "favorites", label: "Favorites", icon: Star, enabled: false },
-  { id: "notes", label: "Notes", icon: StickyNote, enabled: false },
-  { id: "collections", label: "Collections", icon: FolderKanban, enabled: false },
+  { id: "favorites", label: "Favorites", icon: Star, enabled: true },
+  { id: "notes", label: "Notes", icon: StickyNote, enabled: true },
+  { id: "collections", label: "Collections", icon: FolderKanban, enabled: true },
   { id: "shared", label: "Shared", icon: Share2, enabled: false },
-  { id: "trash", label: "Trash", icon: Trash2, enabled: false },
+  { id: "trash", label: "Trash", icon: Trash2, enabled: true },
 ];
 
 function Sidebar({ view, onNavigate }) {
@@ -921,7 +1131,7 @@ function LibraryView({ folders, booksByFolder, onOpenFolder, onNewFolder, onEdit
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-5">
         {folders.map((f, i) => {
-          const list = booksByFolder[f.id] || [];
+          const list = (booksByFolder[f.id] || []).filter((b) => !b.deleted_at);
           const tp = list.reduce((s, b) => s + (b.total_pages || 0), 0);
           const rp = list.reduce((s, b) => s + Math.min(b.last_read_page || 0, b.total_pages || 0), 0);
           const pct = tp > 0 ? Math.round((rp / tp) * 100) : 0;
@@ -935,7 +1145,7 @@ function LibraryView({ folders, booksByFolder, onOpenFolder, onNewFolder, onEdit
   );
 }
 
-function FlatBookListView({ title, subtitle, books, onRead, onEditBook, onResetProgress, onDeleteBook }) {
+function FlatBookListView({ title, subtitle, books, onRead, onEditBook, onResetProgress, onDeleteBook, onToggleFavorite, emptyText }) {
   return (
     <div>
       <div className="mb-6 rise">
@@ -943,12 +1153,139 @@ function FlatBookListView({ title, subtitle, books, onRead, onEditBook, onResetP
         <p className="text-sm mt-1" style={{ color: MUTED }}>{subtitle}</p>
       </div>
       {books.length === 0 ? (
-        <p className="text-center py-16" style={{ color: MUTED }}>Nothing here yet.</p>
+        <p className="text-center py-16" style={{ color: MUTED }}>{emptyText || "Nothing here yet."}</p>
       ) : (
         <div className="grid grid-cols-1 gap-4">
           {books.map((b, i) => (
             <BookRow key={b.id} book={b} color={spineColor(b.folder_id)} delay={i * 40}
-              onRead={() => onRead(b)} onEdit={() => onEditBook(b)} onReset={() => onResetProgress(b)} onDelete={() => onDeleteBook(b)} />
+              onRead={() => onRead(b)} onEdit={() => onEditBook(b)} onReset={() => onResetProgress(b)} onDelete={() => onDeleteBook(b)}
+              onToggleFavorite={onToggleFavorite ? () => onToggleFavorite(b) : undefined} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NotesView({ notes, onNew, onEdit, onDelete }) {
+  return (
+    <div>
+      <div className="flex items-end justify-between mb-6 rise">
+        <div>
+          <p className="text-xs uppercase tracking-widest font-mono" style={{ color: GOLD }}>Your personal notepad</p>
+          <h2 className="font-serif text-3xl font-bold" style={{ color: LEATHER_DARK }}>Notes</h2>
+        </div>
+        <button onClick={onNew} className="btn-lift flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium text-white" style={{ background: LEATHER }}>
+          <Plus size={16} /> New note
+        </button>
+      </div>
+      {notes.length === 0 ? (
+        <p className="text-center py-16" style={{ color: MUTED }}>No notes yet — jot down a thought.</p>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
+          {notes.map((n, i) => (
+            <div key={n.id} onClick={() => onEdit(n)} className="rise cursor-pointer rounded-xl p-4" style={{ background: CARD, border: `1px solid ${BORDER}`, animationDelay: `${i * 40}ms` }}>
+              <div className="flex items-start justify-between gap-2 mb-2">
+                <h4 className="font-serif font-bold truncate" style={{ color: LEATHER_DARK }}>{n.title || "Untitled note"}</h4>
+                <button onClick={(e) => { e.stopPropagation(); onDelete(n.id); }} className="p-1 -m-1 shrink-0" style={{ color: MUTED }}><Trash2 size={14} /></button>
+              </div>
+              <p className="text-sm line-clamp-4 whitespace-pre-wrap" style={{ color: MUTED }}>{n.content || "No content."}</p>
+              <p className="text-xs font-mono mt-3" style={{ color: MUTED }}>{fmtStamp(n.updated_at).date}</p>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CollectionsView({ collections, onOpen, onNew }) {
+  return (
+    <div>
+      <div className="flex items-end justify-between mb-6 rise">
+        <div>
+          <p className="text-xs uppercase tracking-widest font-mono" style={{ color: GOLD }}>Group books across shelves</p>
+          <h2 className="font-serif text-3xl font-bold" style={{ color: LEATHER_DARK }}>Collections</h2>
+        </div>
+        <button onClick={onNew} className="btn-lift flex items-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium text-white" style={{ background: LEATHER }}>
+          <Plus size={16} /> New collection
+        </button>
+      </div>
+      {collections.length === 0 ? (
+        <p className="text-center py-16" style={{ color: MUTED }}>No collections yet — group related books together, regardless of which shelf they're on.</p>
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-5">
+          {collections.map((c, i) => (
+            <button key={c.id} onClick={() => onOpen(c.id)} className="shelf-card rise text-left rounded-xl overflow-hidden" style={{ background: CARD, border: `1px solid ${BORDER}`, animationDelay: `${i * 60}ms` }}>
+              <div className="h-2.5" style={{ background: spineColor(c.id) }} />
+              <div className="p-5">
+                <FolderKanban size={22} style={{ color: LEATHER }} />
+                <h4 className="font-serif font-bold text-base mt-3" style={{ color: LEATHER_DARK }}>{c.name}</h4>
+                <p className="text-xs font-mono mt-1" style={{ color: MUTED }}>{(c.book_ids || []).length} book{(c.book_ids || []).length !== 1 ? "s" : ""}</p>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CollectionDetailView({ collection, books, onBack, onManageBooks, onDelete, onRead, onEditBook, onResetProgress, onDeleteBook, onToggleFavorite }) {
+  if (!collection) return null;
+  return (
+    <div className="fade">
+      <button onClick={onBack} className="flex items-center gap-1.5 text-sm mb-5" style={{ color: MUTED }}><ArrowLeft size={15} /> Collections</button>
+      <div className="flex items-end justify-between mb-6">
+        <div>
+          <h2 className="font-serif text-2xl font-bold" style={{ color: LEATHER_DARK }}>{collection.name}</h2>
+          <p className="text-sm" style={{ color: MUTED }}>{books.length} book{books.length !== 1 ? "s" : ""} in this collection</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button onClick={onManageBooks} className="btn-lift px-4 py-2 rounded-md text-sm font-medium text-white" style={{ background: LEATHER }}>Manage books</button>
+          <button onClick={onDelete} className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Trash2 size={17} /></button>
+        </div>
+      </div>
+      {books.length === 0 ? (
+        <p className="text-center py-16" style={{ color: MUTED }}>No books in this collection yet.</p>
+      ) : (
+        <div className="grid grid-cols-1 gap-4">
+          {books.map((b, i) => (
+            <BookRow key={b.id} book={b} color={spineColor(b.folder_id)} delay={i * 40}
+              onRead={() => onRead(b)} onEdit={() => onEditBook(b)} onReset={() => onResetProgress(b)} onDelete={() => onDeleteBook(b)}
+              onToggleFavorite={() => onToggleFavorite(b)} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TrashView({ books, onRestore, onPermanentDelete }) {
+  return (
+    <div>
+      <div className="mb-6 rise">
+        <h2 className="font-serif text-3xl font-bold" style={{ color: LEATHER_DARK }}>Trash</h2>
+        <p className="text-sm mt-1" style={{ color: MUTED }}>Deleted books stay here until you permanently remove them.</p>
+      </div>
+      {books.length === 0 ? (
+        <p className="text-center py-16" style={{ color: MUTED }}>Trash is empty.</p>
+      ) : (
+        <div className="grid grid-cols-1 gap-4">
+          {books.map((b, i) => (
+            <div key={b.id} className="rise rounded-xl p-5 flex items-center gap-4" style={{ background: CARD, border: `1px solid ${BORDER}`, animationDelay: `${i * 40}ms` }}>
+              <div className="h-14 w-11 rounded-sm shrink-0 flex items-center justify-center" style={{ background: spineColor(b.folder_id) }}>
+                <FileText size={18} color="white" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="font-serif font-bold truncate" style={{ color: LEATHER_DARK }}>{b.name}</p>
+                <p className="text-xs font-mono" style={{ color: MUTED }}>{b.folderName} · deleted {fmtStamp(b.deleted_at).date}</p>
+              </div>
+              <button onClick={() => onRestore(b)} className="btn-lift flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-white shrink-0" style={{ background: GREEN }}>
+                <RotateCcw size={14} /> Restore
+              </button>
+              <button onClick={() => onPermanentDelete(b)} className="p-2 rounded-md hover:bg-black/5 shrink-0" style={{ color: RED }} title="Delete permanently"><Trash2 size={17} /></button>
+            </div>
           ))}
         </div>
       )}
@@ -993,7 +1330,7 @@ function Dashboard({ folders, booksByFolder, allBooksFlat, onOpenFolder, onNewFo
   const finished = allBooksFlat.filter((b) => progressOf(b) >= 100).length;
 
   const chartData = folders.map((f) => {
-    const list = booksByFolder[f.id] || [];
+    const list = (booksByFolder[f.id] || []).filter((b) => !b.deleted_at);
     const tp = list.reduce((s, b) => s + (b.total_pages || 0), 0);
     const rp = list.reduce((s, b) => s + Math.min(b.last_read_page || 0, b.total_pages || 0), 0);
     return { name: f.name, percent: tp > 0 ? Math.round((rp / tp) * 100) : 0, count: list.length };
@@ -1082,7 +1419,7 @@ function Dashboard({ folders, booksByFolder, allBooksFlat, onOpenFolder, onNewFo
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-5">
         {folders.map((f, i) => {
-          const list = booksByFolder[f.id] || [];
+          const list = (booksByFolder[f.id] || []).filter((b) => !b.deleted_at);
           const tp = list.reduce((s, b) => s + (b.total_pages || 0), 0);
           const rp = list.reduce((s, b) => s + Math.min(b.last_read_page || 0, b.total_pages || 0), 0);
           const pct = tp > 0 ? Math.round((rp / tp) * 100) : 0;
@@ -1138,7 +1475,7 @@ function ShelfCard({ folder, count, percent, delay, onOpen, onEdit, onDelete }) 
 }
 
 /* ============================== SHELF VIEW ============================== */
-function ShelfView({ folder, books, onBack, onUploadClick, onRead, onEditBook, onResetProgress, onDeleteBook }) {
+function ShelfView({ folder, books, onBack, onUploadClick, onRead, onEditBook, onResetProgress, onDeleteBook, onToggleFavorite }) {
   if (!folder) return null;
   const color = spineColor(folder.id);
   return (
@@ -1167,14 +1504,14 @@ function ShelfView({ folder, books, onBack, onUploadClick, onRead, onEditBook, o
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4">
-          {books.map((b, i) => <BookRow key={b.id} book={b} color={color} delay={i * 50} onRead={() => onRead(b)} onEdit={() => onEditBook(b)} onReset={() => onResetProgress(b)} onDelete={() => onDeleteBook(b)} />)}
+          {books.map((b, i) => <BookRow key={b.id} book={b} color={color} delay={i * 50} onRead={() => onRead(b)} onEdit={() => onEditBook(b)} onReset={() => onResetProgress(b)} onDelete={() => onDeleteBook(b)} onToggleFavorite={() => onToggleFavorite(b)} />)}
         </div>
       )}
     </div>
   );
 }
 
-function BookRow({ book, color, delay, onRead, onEdit, onReset, onDelete }) {
+function BookRow({ book, color, delay, onRead, onEdit, onReset, onDelete, onToggleFavorite }) {
   const pct = progressOf(book);
   const status = statusOf(book);
   const stamp = fmtStamp(book.uploaded_at);
@@ -1200,12 +1537,17 @@ function BookRow({ book, color, delay, onRead, onEdit, onReset, onDelete }) {
         <button onClick={onRead} className="btn-lift flex items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-white" style={{ background: color }}>
           <BookOpen size={15} /> Read
         </button>
+        {onToggleFavorite && (
+          <button onClick={onToggleFavorite} title={book.is_favorite ? "Remove from favorites" : "Add to favorites"} className="p-2 rounded-md hover:bg-black/5">
+            <Star size={16} fill={book.is_favorite ? GOLD : "none"} style={{ color: book.is_favorite ? GOLD : MUTED }} />
+          </button>
+        )}
         <button onClick={onEdit} title="Edit details" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Pencil size={16} /></button>
         {pct > 0 && (
           <button onClick={onReset} title="Reset reading progress to 0%" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><RotateCcw size={16} /></button>
         )}
         <a href={book.file_url} download={book.file_name} title="Download" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Download size={17} /></a>
-        <button onClick={onDelete} title="Delete" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Trash2 size={17} /></button>
+        <button onClick={onDelete} title="Move to Trash" className="p-2 rounded-md hover:bg-black/5" style={{ color: MUTED }}><Trash2 size={17} /></button>
       </div>
     </div>
   );
@@ -1392,7 +1734,7 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
               </div>
               <button onClick={goNext} disabled={editMode || !pages || pageIndex >= pages.length - 1} className="p-2 rounded-md text-white hover:bg-white/10 disabled:opacity-30"><ChevronRight size={18} /></button>
             </div>
-            <p className="text-center text-xs pb-1" style={{ color: "#B7A88C" }}>This is your real document, rendered as-is — page count is measured directly from it.</p>
+            <p className="text-center text-xs pb-1" style={{ color: "#B7A88C" }}>Page count is measured from how this document renders in your browser — it may differ slightly from Word's own count. For exact page numbers, upload as PDF instead.</p>
           </div>
         )}
 
