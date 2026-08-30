@@ -119,37 +119,33 @@ async function detectDocxPageCount(file) {
   return null;
 }
 
-/* ---- Split flowing docx HTML into N "virtual pages" of roughly equal length,
-   so the reader can show one page at a time like a real paginated document. ---- */
-function splitHtmlIntoPages(html, totalPages) {
-  const safeTotal = Math.max(1, totalPages || 1);
+/* ---- Split flowing docx HTML into readable chunks based on actual content
+   size (NOT forced to match the declared page count — a document may not have
+   enough natural break-points to hit an arbitrary target, which previously
+   caused the page counter to silently fall short of the real total). The
+   reader maps these chunks proportionally onto the declared total page count,
+   so "Page X of Y" and progress % always stay accurate to what you set. ---- */
+function chunkHtmlForReading(html) {
+  const TARGET_CHARS_PER_CHUNK = 1500;
   try {
     const doc = new DOMParser().parseFromString(html || "", "text/html");
     const nodes = Array.from(doc.body.children);
     if (nodes.length === 0) return [html || ""];
-    const weights = nodes.map((n) => Math.max(30, (n.textContent || "").length + (n.tagName === "TABLE" ? 500 : 0)));
-    const total = weights.reduce((a, b) => a + b, 0);
-    const target = total / safeTotal;
-    const pages = [];
+    const chunks = [];
     let current = [];
-    let currentWeight = 0;
-    nodes.forEach((node, i) => {
+    let currentLen = 0;
+    nodes.forEach((node) => {
+      const len = (node.textContent || "").length + (node.tagName === "TABLE" ? 400 : 0);
       current.push(node.outerHTML);
-      currentWeight += weights[i];
-      const remainingNodes = nodes.length - i - 1;
-      const remainingPages = safeTotal - pages.length - 1;
-      if (pages.length < safeTotal - 1 && currentWeight >= target && remainingNodes >= remainingPages) {
-        pages.push(current.join(""));
+      currentLen += len;
+      if (currentLen >= TARGET_CHARS_PER_CHUNK) {
+        chunks.push(current.join(""));
         current = [];
-        currentWeight = 0;
+        currentLen = 0;
       }
     });
-    if (current.length) pages.push(current.join(""));
-    while (pages.length > safeTotal && pages.length > 1) {
-      const last = pages.pop();
-      pages[pages.length - 1] += last;
-    }
-    return pages.length ? pages : [html || ""];
+    if (current.length) chunks.push(current.join(""));
+    return chunks.length ? chunks : [html || ""];
   } catch (e) {
     return [html || ""];
   }
@@ -1103,32 +1099,51 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit }) {
     if (isDocx) {
       (async () => {
         try {
+          let chunks;
           if (book.edited_html) {
             let parsedPages = null;
             try {
               const maybe = JSON.parse(book.edited_html);
               if (Array.isArray(maybe) && maybe.length) parsedPages = maybe;
             } catch (e) { /* not JSON — legacy plain-html save */ }
-            setPages(parsedPages || splitHtmlIntoPages(book.edited_html, book.total_pages));
-            return;
+            chunks = parsedPages || chunkHtmlForReading(book.edited_html);
+          } else {
+            const res = await fetch(book.file_url);
+            const buf = await res.arrayBuffer();
+            const result = await mammoth.convertToHtml({ arrayBuffer: buf });
+            const html = result.value || "<p><em>(Empty document)</em></p>";
+            chunks = chunkHtmlForReading(html);
           }
-          const res = await fetch(book.file_url);
-          const buf = await res.arrayBuffer();
-          const result = await mammoth.convertToHtml({ arrayBuffer: buf });
-          const html = result.value || "<p><em>(Empty document)</em></p>";
-          setPages(splitHtmlIntoPages(html, book.total_pages));
+          setPages(chunks);
+          // Resume at the chunk that proportionally matches previously saved progress.
+          const total = book.total_pages || 1;
+          const startBookPage = book.last_read_page || 1;
+          const startIdx = Math.max(0, Math.min(chunks.length - 1, Math.round((startBookPage / total) * chunks.length) - 1));
+          setPageIndex(startIdx);
         } catch (e) {
           setHtmlError("This document could not be previewed. You can still download it.");
         }
       })();
     }
-  }, [isDocx, book.file_url, book.edited_html, book.total_pages]);
+  }, [isDocx, book.file_url, book.edited_html, book.total_pages, book.last_read_page]);
 
   useEffect(() => {
     if (isDocx && pages && contentRef.current) {
       contentRef.current.innerHTML = pages[pageIndex] || "";
     }
   }, [isDocx, pages, pageIndex]);
+
+  // Maps an internal content-chunk index to the "book page" number the user
+  // actually declared, so the counter and progress % always match their total.
+  const bookPageForIndex = (idx) => {
+    if (!pages || pages.length === 0) return 1;
+    return Math.max(1, Math.min(book.total_pages, Math.round(((idx + 1) / pages.length) * book.total_pages)));
+  };
+  const indexForBookPage = (bp) => {
+    if (!pages || pages.length === 0) return 0;
+    const idx = Math.round((bp / book.total_pages) * pages.length) - 1;
+    return Math.max(0, Math.min(pages.length - 1, idx));
+  };
 
   const handleInput = () => { if (!isDirty) setIsDirty(true); };
 
@@ -1150,7 +1165,7 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit }) {
   const goPrev = () => { if (!editMode) setPageIndex((p) => Math.max(0, p - 1)); };
   const goNext = () => { if (!editMode && pages) setPageIndex((p) => Math.min(pages.length - 1, p + 1)); };
 
-  const currentPage = isPdf ? pdfPage : pageIndex + 1;
+  const currentPage = isPdf ? pdfPage : bookPageForIndex(pageIndex);
   const requestClose = () => {
     if (isDocx && editMode && isDirty) { setStage("discardCheck"); return; }
     setStage("confirmPage");
@@ -1214,7 +1229,7 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit }) {
         )}
 
         {isDocx && (
-          <div className="w-full h-full max-w-3xl flex flex-col">
+          <div className="w-full h-full max-w-5xl flex flex-col">
             {htmlError ? (
               <div className="flex-1 flex items-center justify-center text-center px-6" style={{ color: "#F1E6D2" }}>
                 <div><AlertCircle className="mx-auto mb-3" /><p>{htmlError}</p></div>
@@ -1224,8 +1239,8 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit }) {
             ) : (
               <div className="flex-1 overflow-y-auto flex items-start justify-center py-2" style={{ background: "#3A3630", borderRadius: 10 }}>
                 <div key={pageIndex} className="fade" style={{
-                  background: "white", width: "100%", maxWidth: 640, minHeight: "100%",
-                  boxShadow: "0 12px 34px rgba(0,0,0,0.4)", padding: "56px 60px 40px",
+                  background: "white", width: "100%", maxWidth: 860, minHeight: "100%",
+                  boxShadow: "0 12px 34px rgba(0,0,0,0.4)", padding: "72px 88px 48px",
                   display: "flex", flexDirection: "column",
                 }}>
                   <div
@@ -1235,9 +1250,9 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit }) {
                     suppressContentEditableWarning
                     onInput={handleInput}
                     className={isDirty ? "editing-live" : ""}
-                    style={{ outline: "none", lineHeight: 1.7, color: "#241A15", fontFamily: "Georgia, serif", fontSize: `${16 * fontScale}px`, flex: 1 }}
+                    style={{ outline: "none", lineHeight: 1.75, color: "#241A15", fontFamily: "Georgia, serif", fontSize: `${18 * fontScale}px`, flex: 1 }}
                   />
-                  <p className="text-center text-xs pt-8" style={{ color: "#B0A99C", fontFamily: "Georgia, serif" }}>Page {pageIndex + 1}</p>
+                  <p className="text-center text-xs pt-8" style={{ color: "#B0A99C", fontFamily: "Georgia, serif" }}>Page {bookPageForIndex(pageIndex)}</p>
                 </div>
               </div>
             )}
@@ -1245,10 +1260,10 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit }) {
               <button onClick={goPrev} disabled={editMode || pageIndex === 0} className="p-2 rounded-md text-white hover:bg-white/10 disabled:opacity-30"><ChevronLeft size={18} /></button>
               <div className="flex items-center gap-2 text-sm" style={{ color: "#F1E6D2" }}>
                 Page
-                <input type="number" value={pageIndex + 1} min={1} max={pages ? pages.length : book.total_pages} disabled={editMode}
-                  onChange={(e) => setPageIndex(Math.min((pages ? pages.length : book.total_pages) - 1, Math.max(0, (parseInt(e.target.value, 10) || 1) - 1)))}
+                <input type="number" value={bookPageForIndex(pageIndex)} min={1} max={book.total_pages} disabled={editMode}
+                  onChange={(e) => setPageIndex(indexForBookPage(Math.min(book.total_pages, Math.max(1, parseInt(e.target.value, 10) || 1))))}
                   className="w-16 text-center rounded-md px-2 py-1 text-black disabled:opacity-60" />
-                of {pages ? pages.length : book.total_pages}
+                of {book.total_pages}
               </div>
               <button onClick={goNext} disabled={editMode || !pages || pageIndex >= pages.length - 1} className="p-2 rounded-md text-white hover:bg-white/10 disabled:opacity-30"><ChevronRight size={18} /></button>
             </div>
