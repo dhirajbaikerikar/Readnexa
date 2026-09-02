@@ -8,7 +8,7 @@ import {
   ArrowLeft, X, Check, AlertCircle, Loader2, Pencil, Save, RotateCcw,
   ChevronLeft, ChevronRight, LayoutDashboard, BookCopy, Clock, CheckCircle2,
   Settings as SettingsIcon, Sparkles, Sun, Moon, ZoomIn, ZoomOut,
-  Play, Pause, SkipBack, SkipForward, Volume2, VolumeX,
+  Play, Pause, SkipBack, SkipForward, Volume2, VolumeX, Languages, ArrowLeftRight,
   Star, StickyNote, FolderKanban, Share2, Search
 } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Tooltip, Cell } from "recharts";
@@ -129,22 +129,56 @@ async function renderDocxToPages(arrayBuffer) {
   }
 }
 
-async function detectDocxPageCount(file) {
-  try {
-    const buf = await file.arrayBuffer();
-    const pages = await renderDocxToPages(buf);
-    return pages.length || null;
-  } catch (e) {
-    return null;
-  }
-}
-
+// NOTE: automatic page-count detection for .docx was removed. Rendering the
+// same document twice (once to detect, once to read) produced inconsistent
+// page counts depending on rendering conditions — sometimes wildly wrong
+// (e.g. a real 27-page document detected as 3 pages). Rather than guess,
+// .docx page counts are now always entered manually, matching the number
+// Word itself shows (bottom-left status bar) — stable and predictable.
+// PDF detection is untouched and stays fully automatic: PDF page counts are
+// read directly from the file's own structure via PDF.js, not estimated.
 async function detectPageCount(file, ext) {
   try {
     if (ext === "pdf") return await detectPdfPageCount(file);
-    if (ext === "docx") return await detectDocxPageCount(file);
   } catch (e) { return null; }
-  return null; // legacy .doc — not supported in-browser
+  return null; // .docx and legacy .doc — always entered manually
+}
+
+/* ---- Translation (free, no API key) ----
+   Uses MyMemory's free public translation API. No account required for
+   light use; it has a fair-use daily limit, so long pages are chunked into
+   pieces to stay within its per-request size limit, and requests are sent
+   one at a time. This is a genuinely free service, not a paid one wired up
+   to look free — expect occasional slowness or rate-limiting at busy times. */
+const LANG_LABELS = { en: "English", hi: "Hindi", mr: "Marathi" };
+
+function splitForTranslation(text, maxLen = 480) {
+  const sentences = text.split(/(?<=[.!?।])\s+/);
+  const chunks = [];
+  let current = "";
+  sentences.forEach((s) => {
+    if ((current + " " + s).length > maxLen && current) { chunks.push(current.trim()); current = s; }
+    else current = current ? current + " " + s : s;
+  });
+  if (current.trim()) chunks.push(current.trim());
+  return chunks.length ? chunks : [text];
+}
+
+async function translateText(text, sourceLang, targetLang) {
+  if (!text || !text.trim()) return "";
+  const chunks = splitForTranslation(text);
+  const results = [];
+  for (const chunk of chunks) {
+    const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(chunk)}&langpair=${sourceLang}|${targetLang}`;
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      results.push(data?.responseData?.translatedText || chunk);
+    } catch (e) {
+      results.push(chunk); // fall back to original text for this chunk on failure
+    }
+  }
+  return results.join(" ");
 }
 
 /* ============================== ROOT APP ============================== */
@@ -852,6 +886,8 @@ export default function App() {
                 className="w-full border rounded-md px-3 py-2 mb-2 focus:outline-none focus:ring-2" style={{ borderColor: BORDER }} />
               {detectedPages !== null ? (
                 <p className="text-xs mb-3 flex items-center gap-1" style={{ color: MUTED }}><Pencil size={11} /> Enter the correct page count below.</p>
+              ) : pendingFile && pendingFile.ext === "docx" ? (
+                <p className="text-xs mb-3" style={{ color: MUTED }}>Check the page count shown in Microsoft Word (bottom-left status bar) and enter it here — this number won't be changed automatically.</p>
               ) : detectFailed ? (
                 <p className="text-xs mb-3" style={{ color: MUTED }}>We couldn't automatically detect the page count for this file — please enter it manually.</p>
               ) : (
@@ -897,7 +933,6 @@ export default function App() {
           onClose={() => setReadingTarget(null)}
           onCommitProgress={(page) => updateBook(readingTarget.folderId, readingTarget.book.id, { last_read_page: page, last_read_at: new Date().toISOString() })}
           onSaveEdit={(html) => updateBook(readingTarget.folderId, readingTarget.book.id, { edited_html: html, edited_at: new Date().toISOString() })}
-          onFixTotalPages={(realTotal) => updateBook(readingTarget.folderId, readingTarget.book.id, { total_pages: realTotal, last_read_page: Math.min(readingTarget.book.last_read_page || 0, realTotal) })}
         />
       )}
 
@@ -1555,13 +1590,13 @@ function BookRow({ book, color, delay, onRead, onEdit, onReset, onDelete, onTogg
 }
 
 /* ============================== BOOK READER ============================== */
-function NarrationBar({ state, rate, error, supported, onPlayPause, onStop, onSkip, onRateChange }) {
+function NarrationBar({ state, rate, error, supported, onPlayPause, onStop, onSkip, onRateChange, voices, selectedVoiceURI, onVoiceChange, totalPages, jumpPage, onJumpPageChange, onJumpAndNarrate }) {
   if (!supported) {
     return <p className="text-center text-xs py-2" style={{ color: "#B7A88C" }}>Voice narration isn't supported in this browser.</p>;
   }
   return (
-    <div className="flex flex-col items-center gap-1.5 py-2">
-      <div className="flex items-center gap-3">
+    <div className="flex flex-col items-center gap-2 py-2 w-full">
+      <div className="flex items-center gap-3 flex-wrap justify-center">
         <button onClick={() => onSkip(-1)} title="Previous page" className="p-2 rounded-md hover:bg-white/10 text-white"><SkipBack size={17} /></button>
         <button onClick={onPlayPause} title={state === "playing" ? "Pause narration" : "Play narration"}
           className="btn-lift h-10 w-10 rounded-full flex items-center justify-center" style={{ background: GOLD, color: LEATHER_DARK }}>
@@ -1571,7 +1606,7 @@ function NarrationBar({ state, rate, error, supported, onPlayPause, onStop, onSk
         {state !== "stopped" && (
           <button onClick={onStop} title="Stop narration" className="p-2 rounded-md hover:bg-white/10 text-white"><VolumeX size={16} /></button>
         )}
-        <div className="flex items-center gap-1 ml-2">
+        <div className="flex items-center gap-1 ml-1">
           {[0.75, 1, 1.25, 1.5].map((r) => (
             <button key={r} onClick={() => onRateChange(r)}
               className="px-2 py-1 rounded-md text-xs font-mono"
@@ -1581,16 +1616,37 @@ function NarrationBar({ state, rate, error, supported, onPlayPause, onStop, onSk
           ))}
         </div>
       </div>
+
+      <div className="flex items-center gap-2 flex-wrap justify-center">
+        <select value={selectedVoiceURI} onChange={(e) => onVoiceChange(e.target.value)}
+          className="text-xs rounded-md px-2 py-1.5 max-w-[220px]" style={{ background: "rgba(255,255,255,0.1)", color: "#F1E6D2" }}>
+          <option value="">Default voice</option>
+          {voices.map((v) => (
+            <option key={v.voiceURI} value={v.voiceURI} style={{ color: "black" }}>{v.name} ({v.lang})</option>
+          ))}
+        </select>
+
+        <div className="flex items-center gap-1.5">
+          <input type="number" min={1} max={totalPages} value={jumpPage} onChange={(e) => onJumpPageChange(e.target.value)}
+            placeholder="Page #" onKeyDown={(e) => e.key === "Enter" && onJumpAndNarrate()}
+            className="w-20 text-center rounded-md px-2 py-1.5 text-xs text-black" />
+          <button onClick={onJumpAndNarrate} title="Jump to this page and start narrating"
+            className="btn-lift flex items-center gap-1 px-2.5 py-1.5 rounded-md text-xs font-medium" style={{ background: GOLD, color: LEATHER_DARK }}>
+            <Play size={12} /> Go &amp; read
+          </button>
+        </div>
+      </div>
+
       <p className="text-xs flex items-center gap-1.5" style={{ color: state === "stopped" ? "#B7A88C" : GOLD }}>
         <Volume2 size={12} />
-        {state === "playing" ? "Narrating this page…" : state === "paused" ? "Narration paused" : "Voice narration — play to start"}
+        {state === "playing" ? "Narrating this page…" : state === "paused" ? "Narration paused" : "Voice narration — play, or enter a page number to jump straight there"}
       </p>
       {error && <p className="text-xs" style={{ color: "#E08A8A" }}>{error}</p>}
     </div>
   );
 }
 
-function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPages }) {
+function BookReader({ book, onClose, onCommitProgress, onSaveEdit }) {
   const isPdf = book.file_type === "pdf";
   const isDocx = book.file_type === "docx";
   const isLegacyDoc = book.file_type === "doc";
@@ -1604,7 +1660,6 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
   const [isDirty, setIsDirty] = useState(false);
   const [fontScale, setFontScale] = useState(1);
   const contentRef = useRef(null);
-  const fixedRef = useRef(false);
 
   const [stage, setStage] = useState("reading");
   const [manualPage, setManualPage] = useState("");
@@ -1614,8 +1669,34 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
   const [narrationState, setNarrationState] = useState("stopped"); // stopped | playing | paused
   const [narrationRate, setNarrationRate] = useState(1);
   const [narrationError, setNarrationError] = useState("");
+  const [voices, setVoices] = useState([]);
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState(() => {
+    try { return localStorage.getItem("readnexa-voice") || ""; } catch (e) { return ""; }
+  });
+  const [jumpPage, setJumpPage] = useState("");
   const pdfDocRef = useRef(null);
   const narrationActiveRef = useRef(false);
+
+  // ---- Translation panel ----
+  const [showTranslate, setShowTranslate] = useState(false);
+  const [sourceLang, setSourceLang] = useState("en");
+  const [targetLang, setTargetLang] = useState("hi");
+  const [translatedText, setTranslatedText] = useState("");
+  const [translating, setTranslating] = useState(false);
+  const [translateError, setTranslateError] = useState("");
+
+  useEffect(() => {
+    if (!speechSupported) return;
+    const loadVoices = () => setVoices(window.speechSynthesis.getVoices());
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+  }, [speechSupported]);
+
+  const chooseVoice = (uri) => {
+    setSelectedVoiceURI(uri);
+    try { localStorage.setItem("readnexa-voice", uri); } catch (e) {}
+  };
+  const getSelectedVoiceObj = () => voices.find((v) => v.voiceURI === selectedVoiceURI) || null;
 
   useEffect(() => {
     if (isPdf) {
@@ -1645,13 +1726,50 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
     return "";
   };
 
-  const speakPage = async (pageArg, rateOverride) => {
+  const translateCurrentPage = async () => {
+    setTranslating(true);
+    setTranslateError("");
+    setTranslatedText("");
+    try {
+      const pageArg = isPdf ? pdfPage : pageIndex;
+      const text = await getPageText(pageArg);
+      if (!text.trim()) { setTranslateError("No readable text found on this page."); setTranslating(false); return; }
+      const result = await translateText(text, sourceLang, targetLang);
+      setTranslatedText(result);
+    } catch (e) {
+      setTranslateError("Translation failed — please try again.");
+    }
+    setTranslating(false);
+  };
+
+  const swapLanguages = () => {
+    setSourceLang(targetLang);
+    setTargetLang(sourceLang);
+    setTranslatedText("");
+  };
+
+  const speakTranslated = () => {
+    if (!speechSupported || !translatedText.trim()) return;
+    handleNarrationStop();
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(translatedText);
+    utter.rate = narrationRate;
+    const match = voices.find((v) => v.lang.toLowerCase().startsWith(targetLang));
+    if (match) { utter.voice = match; utter.lang = match.lang; }
+    else { utter.lang = targetLang === "hi" ? "hi-IN" : targetLang === "mr" ? "mr-IN" : "en-US"; }
+    utter.onerror = () => setTranslateError("No voice available to read this language aloud on your device.");
+    window.speechSynthesis.speak(utter);
+  };
+
+  const speakPage = async (pageArg, rateOverride, voiceOverride) => {
     setNarrationError("");
     const text = await getPageText(pageArg);
     if (!text || !text.trim()) { goToNextForNarration(pageArg); return; }
     window.speechSynthesis.cancel();
     const utter = new SpeechSynthesisUtterance(text);
     utter.rate = rateOverride != null ? rateOverride : narrationRate;
+    const v = voiceOverride !== undefined ? voiceOverride : getSelectedVoiceObj();
+    if (v) { utter.voice = v; utter.lang = v.lang; }
     utter.onend = () => { if (narrationActiveRef.current) goToNextForNarration(pageArg); };
     utter.onerror = () => { setNarrationError("Narration was interrupted."); };
     setNarrationState("playing");
@@ -1697,6 +1815,31 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
     setNarrationRate(r);
     if (narrationState === "playing") { narrationActiveRef.current = true; speakPage(isPdf ? pdfPage : pageIndex, r); }
   };
+  const changeVoice = (uri) => {
+    chooseVoice(uri);
+    if (narrationState === "playing") {
+      const v = voices.find((vv) => vv.voiceURI === uri) || null;
+      narrationActiveRef.current = true;
+      speakPage(isPdf ? pdfPage : pageIndex, undefined, v);
+    }
+  };
+  const handleJumpAndNarrate = () => {
+    const target = parseInt(jumpPage, 10);
+    if (!target || target < 1) return;
+    const clamped = Math.max(1, Math.min(book.total_pages, target));
+    if (speechSupported) window.speechSynthesis.cancel();
+    if (isPdf) {
+      setPdfPage(clamped);
+      narrationActiveRef.current = true;
+      speakPage(clamped);
+    } else {
+      const idx = indexForBookPage(clamped);
+      setPageIndex(idx);
+      narrationActiveRef.current = true;
+      speakPage(idx);
+    }
+    setJumpPage("");
+  };
 
   useEffect(() => {
     if (isDocx) {
@@ -1715,15 +1858,13 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
             realPages = await renderDocxToPages(buf);
           }
           setPages(realPages);
-          const startIdx = Math.max(0, Math.min(realPages.length - 1, (book.last_read_page || 1) - 1));
+          // Resume at the render-chunk that proportionally matches previously
+          // saved progress. Your declared page count (book.total_pages) is
+          // never changed automatically — it stays exactly what you entered.
+          const total = book.total_pages || 1;
+          const startBookPage = book.last_read_page || 1;
+          const startIdx = Math.max(0, Math.min(realPages.length - 1, Math.round((startBookPage / total) * realPages.length) - 1));
           setPageIndex(startIdx);
-          // Self-heal: this is now the real, authoritative page count. If the
-          // stored total doesn't match it (e.g. from an older/incorrect entry
-          // or a manual override that didn't match reality), correct it once.
-          if (!fixedRef.current && realPages.length && realPages.length !== book.total_pages) {
-            fixedRef.current = true;
-            onFixTotalPages(realPages.length);
-          }
         } catch (e) {
           setHtmlError("This document could not be previewed. You can still download it.");
         }
@@ -1737,7 +1878,20 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
     }
   }, [isDocx, pages, pageIndex]);
 
-  const totalPages = isDocx && pages ? pages.length : book.total_pages;
+  // Your declared page count is the single source of truth for docx — it is
+  // never overwritten automatically. "pages" (the real rendered chunks) is
+  // only used internally to move through the content; the number shown to
+  // you is always mapped back onto your own total.
+  const totalPages = book.total_pages;
+  const bookPageForIndex = (idx) => {
+    if (!pages || pages.length === 0) return 1;
+    return Math.max(1, Math.min(totalPages, Math.round(((idx + 1) / pages.length) * totalPages)));
+  };
+  const indexForBookPage = (bp) => {
+    if (!pages || pages.length === 0) return 0;
+    const idx = Math.round((bp / totalPages) * pages.length) - 1;
+    return Math.max(0, Math.min(pages.length - 1, idx));
+  };
 
   const handleInput = () => { if (!isDirty) setIsDirty(true); };
 
@@ -1759,7 +1913,7 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
   const goPrev = () => { if (!editMode) setPageIndex((p) => Math.max(0, p - 1)); };
   const goNext = () => { if (!editMode && pages) setPageIndex((p) => Math.min(pages.length - 1, p + 1)); };
 
-  const currentPage = isPdf ? pdfPage : pageIndex + 1;
+  const currentPage = isPdf ? pdfPage : bookPageForIndex(pageIndex);
   const requestClose = () => {
     handleNarrationStop();
     if (isDocx && editMode && isDirty) { setStage("discardCheck"); return; }
@@ -1792,9 +1946,45 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
               </button>
             </>
           )}
+          {!editMode && !isLegacyDoc && (
+            <button onClick={() => setShowTranslate((s) => !s)} title="Translate this page"
+              className="p-2 rounded-md hover:bg-white/10" style={{ color: showTranslate ? GOLD : "white" }}>
+              <Languages size={18} />
+            </button>
+          )}
           <button onClick={requestClose} className="p-2 rounded-md hover:bg-white/10 text-white"><X size={20} /></button>
         </div>
       </div>
+
+      {showTranslate && !isLegacyDoc && (
+        <div className="px-5 py-3 shrink-0" style={{ background: "#2A211B", borderBottom: `1px solid ${BORDER}` }}>
+          <div className="flex items-center gap-2 flex-wrap mb-2">
+            <select value={sourceLang} onChange={(e) => setSourceLang(e.target.value)} className="text-xs rounded-md px-2 py-1.5" style={{ background: "rgba(255,255,255,0.1)", color: "#F1E6D2" }}>
+              {Object.entries(LANG_LABELS).map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+            </select>
+            <button onClick={swapLanguages} title="Swap languages" className="p-1.5 rounded-md hover:bg-white/10 text-white"><ArrowLeftRight size={14} /></button>
+            <select value={targetLang} onChange={(e) => setTargetLang(e.target.value)} className="text-xs rounded-md px-2 py-1.5" style={{ background: "rgba(255,255,255,0.1)", color: "#F1E6D2" }}>
+              {Object.entries(LANG_LABELS).map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+            </select>
+            <button onClick={translateCurrentPage} disabled={translating}
+              className="btn-lift flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium disabled:opacity-50" style={{ background: GOLD, color: LEATHER_DARK }}>
+              {translating ? <Loader2 size={13} className="animate-spin" /> : <Languages size={13} />} Translate this page
+            </button>
+            {translatedText && (
+              <button onClick={speakTranslated} className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium" style={{ background: "rgba(255,255,255,0.1)", color: "#F1E6D2" }}>
+                <Volume2 size={13} /> Read this aloud
+              </button>
+            )}
+          </div>
+          {translateError && <p className="text-xs mb-1" style={{ color: "#E08A8A" }}>{translateError}</p>}
+          {translatedText && (
+            <p className="text-sm max-h-32 overflow-y-auto whitespace-pre-wrap" style={{ color: "#F1E6D2" }}>{translatedText}</p>
+          )}
+          <p className="text-[11px] mt-1" style={{ color: "#8A7B68" }}>
+            Free translation service — quality and availability may vary. Marathi voices are rare on most devices; Hindi voices are more commonly available.
+          </p>
+        </div>
+      )}
 
       {editMode && (
         <div className="text-center text-xs py-1.5" style={{ background: "#2F241D", color: GOLD }}>
@@ -1821,7 +2011,9 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
             </div>
             <NarrationBar state={narrationState} rate={narrationRate} error={narrationError} supported={speechSupported}
               onPlayPause={handleNarrationPlayPause} onStop={handleNarrationStop}
-              onSkip={handleNarrationSkip} onRateChange={changeNarrationRate} />
+              onSkip={handleNarrationSkip} onRateChange={changeNarrationRate}
+              voices={voices} selectedVoiceURI={selectedVoiceURI} onVoiceChange={changeVoice}
+              totalPages={book.total_pages} jumpPage={jumpPage} onJumpPageChange={setJumpPage} onJumpAndNarrate={handleJumpAndNarrate} />
             <p className="text-center text-xs pb-1" style={{ color: "#B7A88C" }}>The PDF above is your real, unmodified file. Use the controls to bookmark where you are.</p>
           </div>
         )}
@@ -1856,8 +2048,8 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
               <button onClick={goPrev} disabled={editMode || pageIndex === 0} className="p-2 rounded-md text-white hover:bg-white/10 disabled:opacity-30"><ChevronLeft size={18} /></button>
               <div className="flex items-center gap-2 text-sm" style={{ color: "#F1E6D2" }}>
                 Page
-                <input type="number" value={pageIndex + 1} min={1} max={totalPages} disabled={editMode}
-                  onChange={(e) => setPageIndex(Math.min(totalPages - 1, Math.max(0, (parseInt(e.target.value, 10) || 1) - 1)))}
+                <input type="number" value={bookPageForIndex(pageIndex)} min={1} max={totalPages} disabled={editMode}
+                  onChange={(e) => setPageIndex(indexForBookPage(Math.min(totalPages, Math.max(1, parseInt(e.target.value, 10) || 1))))}
                   className="w-16 text-center rounded-md px-2 py-1 text-black disabled:opacity-60" />
                 of {totalPages}
               </div>
@@ -1866,7 +2058,9 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
             {!editMode && (
               <NarrationBar state={narrationState} rate={narrationRate} error={narrationError} supported={speechSupported}
                 onPlayPause={handleNarrationPlayPause} onStop={handleNarrationStop}
-                onSkip={handleNarrationSkip} onRateChange={changeNarrationRate} />
+                onSkip={handleNarrationSkip} onRateChange={changeNarrationRate}
+                voices={voices} selectedVoiceURI={selectedVoiceURI} onVoiceChange={changeVoice}
+                totalPages={totalPages} jumpPage={jumpPage} onJumpPageChange={setJumpPage} onJumpAndNarrate={handleJumpAndNarrate} />
             )}
             <p className="text-center text-xs pb-1" style={{ color: "#B7A88C" }}>Page count is measured from how this document renders in your browser — it may differ slightly from Word's own count. For exact page numbers, upload as PDF instead.</p>
           </div>
