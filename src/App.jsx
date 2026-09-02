@@ -8,6 +8,7 @@ import {
   ArrowLeft, X, Check, AlertCircle, Loader2, Pencil, Save, RotateCcw,
   ChevronLeft, ChevronRight, LayoutDashboard, BookCopy, Clock, CheckCircle2,
   Settings as SettingsIcon, Sparkles, Sun, Moon, ZoomIn, ZoomOut,
+  Play, Pause, SkipBack, SkipForward, Volume2, VolumeX,
   Star, StickyNote, FolderKanban, Share2, Search
 } from "lucide-react";
 import { BarChart, Bar, XAxis, YAxis, ResponsiveContainer, Tooltip, Cell } from "recharts";
@@ -1554,6 +1555,41 @@ function BookRow({ book, color, delay, onRead, onEdit, onReset, onDelete, onTogg
 }
 
 /* ============================== BOOK READER ============================== */
+function NarrationBar({ state, rate, error, supported, onPlayPause, onStop, onSkip, onRateChange }) {
+  if (!supported) {
+    return <p className="text-center text-xs py-2" style={{ color: "#B7A88C" }}>Voice narration isn't supported in this browser.</p>;
+  }
+  return (
+    <div className="flex flex-col items-center gap-1.5 py-2">
+      <div className="flex items-center gap-3">
+        <button onClick={() => onSkip(-1)} title="Previous page" className="p-2 rounded-md hover:bg-white/10 text-white"><SkipBack size={17} /></button>
+        <button onClick={onPlayPause} title={state === "playing" ? "Pause narration" : "Play narration"}
+          className="btn-lift h-10 w-10 rounded-full flex items-center justify-center" style={{ background: GOLD, color: LEATHER_DARK }}>
+          {state === "playing" ? <Pause size={18} /> : <Play size={18} className="ml-0.5" />}
+        </button>
+        <button onClick={() => onSkip(1)} title="Next page" className="p-2 rounded-md hover:bg-white/10 text-white"><SkipForward size={17} /></button>
+        {state !== "stopped" && (
+          <button onClick={onStop} title="Stop narration" className="p-2 rounded-md hover:bg-white/10 text-white"><VolumeX size={16} /></button>
+        )}
+        <div className="flex items-center gap-1 ml-2">
+          {[0.75, 1, 1.25, 1.5].map((r) => (
+            <button key={r} onClick={() => onRateChange(r)}
+              className="px-2 py-1 rounded-md text-xs font-mono"
+              style={{ background: rate === r ? GOLD : "rgba(255,255,255,0.1)", color: rate === r ? LEATHER_DARK : "#F1E6D2" }}>
+              {r}×
+            </button>
+          ))}
+        </div>
+      </div>
+      <p className="text-xs flex items-center gap-1.5" style={{ color: state === "stopped" ? "#B7A88C" : GOLD }}>
+        <Volume2 size={12} />
+        {state === "playing" ? "Narrating this page…" : state === "paused" ? "Narration paused" : "Voice narration — play to start"}
+      </p>
+      {error && <p className="text-xs" style={{ color: "#E08A8A" }}>{error}</p>}
+    </div>
+  );
+}
+
 function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPages }) {
   const isPdf = book.file_type === "pdf";
   const isDocx = book.file_type === "docx";
@@ -1572,6 +1608,95 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
 
   const [stage, setStage] = useState("reading");
   const [manualPage, setManualPage] = useState("");
+
+  // ---- Voice narration (Web Speech API — built into the browser, no API key) ----
+  const speechSupported = typeof window !== "undefined" && "speechSynthesis" in window;
+  const [narrationState, setNarrationState] = useState("stopped"); // stopped | playing | paused
+  const [narrationRate, setNarrationRate] = useState(1);
+  const [narrationError, setNarrationError] = useState("");
+  const pdfDocRef = useRef(null);
+  const narrationActiveRef = useRef(false);
+
+  useEffect(() => {
+    if (isPdf) {
+      (async () => {
+        try { pdfDocRef.current = await getDocument(book.file_url).promise; }
+        catch (e) { pdfDocRef.current = null; }
+      })();
+    }
+  }, [isPdf, book.file_url]);
+
+  useEffect(() => () => { if (speechSupported) window.speechSynthesis.cancel(); }, []);
+
+  const getPageText = async (pageArg) => {
+    if (isPdf) {
+      if (!pdfDocRef.current) return "";
+      try {
+        const page = await pdfDocRef.current.getPage(pageArg); // 1-indexed
+        const content = await page.getTextContent();
+        return content.items.map((it) => it.str).join(" ");
+      } catch (e) { return ""; }
+    }
+    if (isDocx && pages) {
+      const html = pages[pageArg] || ""; // 0-indexed
+      try { return new DOMParser().parseFromString(html, "text/html").body.textContent || ""; }
+      catch (e) { return ""; }
+    }
+    return "";
+  };
+
+  const speakPage = async (pageArg, rateOverride) => {
+    setNarrationError("");
+    const text = await getPageText(pageArg);
+    if (!text || !text.trim()) { goToNextForNarration(pageArg); return; }
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = rateOverride != null ? rateOverride : narrationRate;
+    utter.onend = () => { if (narrationActiveRef.current) goToNextForNarration(pageArg); };
+    utter.onerror = () => { setNarrationError("Narration was interrupted."); };
+    setNarrationState("playing");
+    window.speechSynthesis.speak(utter);
+  };
+
+  const goToNextForNarration = (fromPage) => {
+    const atEnd = isPdf ? fromPage >= book.total_pages : fromPage >= ((pages ? pages.length : 1) - 1);
+    if (atEnd) { narrationActiveRef.current = false; setNarrationState("stopped"); return; }
+    const next = fromPage + 1;
+    if (isPdf) setPdfPage(next); else setPageIndex(next);
+    speakPage(next);
+  };
+
+  const handleNarrationPlayPause = () => {
+    if (!speechSupported) { setNarrationError("Voice narration isn't supported in this browser."); return; }
+    if (narrationState === "stopped") {
+      narrationActiveRef.current = true;
+      speakPage(isPdf ? pdfPage : pageIndex);
+    } else if (narrationState === "playing") {
+      window.speechSynthesis.pause();
+      setNarrationState("paused");
+    } else if (narrationState === "paused") {
+      window.speechSynthesis.resume();
+      setNarrationState("playing");
+    }
+  };
+  const handleNarrationStop = () => {
+    narrationActiveRef.current = false;
+    if (speechSupported) window.speechSynthesis.cancel();
+    setNarrationState("stopped");
+  };
+  const handleNarrationSkip = (dir) => {
+    if (speechSupported) window.speechSynthesis.cancel();
+    const current = isPdf ? pdfPage : pageIndex;
+    const min = isPdf ? 1 : 0;
+    const max = isPdf ? book.total_pages : ((pages ? pages.length : 1) - 1);
+    const target = Math.max(min, Math.min(max, current + dir));
+    if (isPdf) setPdfPage(target); else setPageIndex(target);
+    if (narrationState !== "stopped") { narrationActiveRef.current = true; speakPage(target); }
+  };
+  const changeNarrationRate = (r) => {
+    setNarrationRate(r);
+    if (narrationState === "playing") { narrationActiveRef.current = true; speakPage(isPdf ? pdfPage : pageIndex, r); }
+  };
 
   useEffect(() => {
     if (isDocx) {
@@ -1616,7 +1741,7 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
 
   const handleInput = () => { if (!isDirty) setIsDirty(true); };
 
-  const enterEdit = () => setEditMode(true);
+  const enterEdit = () => { handleNarrationStop(); setEditMode(true); };
   const saveEdit = () => {
     const newHtml = contentRef.current ? contentRef.current.innerHTML : pages[pageIndex];
     const nextPages = pages.map((p, i) => (i === pageIndex ? newHtml : p));
@@ -1636,6 +1761,7 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
 
   const currentPage = isPdf ? pdfPage : pageIndex + 1;
   const requestClose = () => {
+    handleNarrationStop();
     if (isDocx && editMode && isDirty) { setStage("discardCheck"); return; }
     setStage("confirmPage");
   };
@@ -1693,6 +1819,9 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
               </div>
               <button onClick={() => setPdfPage((p) => Math.min(book.total_pages, p + 1))} className="p-2 rounded-md text-white hover:bg-white/10"><ChevronRight size={18} /></button>
             </div>
+            <NarrationBar state={narrationState} rate={narrationRate} error={narrationError} supported={speechSupported}
+              onPlayPause={handleNarrationPlayPause} onStop={handleNarrationStop}
+              onSkip={handleNarrationSkip} onRateChange={changeNarrationRate} />
             <p className="text-center text-xs pb-1" style={{ color: "#B7A88C" }}>The PDF above is your real, unmodified file. Use the controls to bookmark where you are.</p>
           </div>
         )}
@@ -1734,6 +1863,11 @@ function BookReader({ book, onClose, onCommitProgress, onSaveEdit, onFixTotalPag
               </div>
               <button onClick={goNext} disabled={editMode || !pages || pageIndex >= pages.length - 1} className="p-2 rounded-md text-white hover:bg-white/10 disabled:opacity-30"><ChevronRight size={18} /></button>
             </div>
+            {!editMode && (
+              <NarrationBar state={narrationState} rate={narrationRate} error={narrationError} supported={speechSupported}
+                onPlayPause={handleNarrationPlayPause} onStop={handleNarrationStop}
+                onSkip={handleNarrationSkip} onRateChange={changeNarrationRate} />
+            )}
             <p className="text-center text-xs pb-1" style={{ color: "#B7A88C" }}>Page count is measured from how this document renders in your browser — it may differ slightly from Word's own count. For exact page numbers, upload as PDF instead.</p>
           </div>
         )}
